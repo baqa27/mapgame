@@ -27,7 +27,12 @@ local Services
 local UPRIGHT = CFrame.Angles(0, 0, math.rad(90)) -- cylinders lie on their side by default
 
 local function getOrCreateFolder()
-	local map = Workspace:FindFirstChild("Map") or Workspace:WaitForChild("Map", 30)
+	local mapsFolder = Workspace:FindFirstChild("Maps")
+	local map
+	if mapsFolder then
+		map = mapsFolder:FindFirstChild("MainGameMap") or mapsFolder:FindFirstChild("LobbyMap")
+	end
+	map = map or Workspace:FindFirstChild("Map") or Workspace:WaitForChild("Map", 30)
 	if not map then
 		return nil
 	end
@@ -49,7 +54,7 @@ end
 local function spawnAll()
 	local folder = getOrCreateFolder()
 	if not folder then
-		warn("[JimpitanSpawnerService] Workspace.Map not found -- no jimpitan spawned.")
+		warn("[JimpitanSpawnerService] Active map gameplay folder not found -- no jimpitan spawned.")
 		return
 	end
 

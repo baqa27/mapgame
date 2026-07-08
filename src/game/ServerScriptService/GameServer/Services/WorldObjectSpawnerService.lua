@@ -19,7 +19,12 @@ local WorldObjectSpawnerService = {}
 local FLAT = CFrame.Angles(0, 0, math.rad(90)) -- cylinders lie on their side by default
 
 local function getGameplayFolder()
-	local map = Workspace:FindFirstChild("Map") or Workspace:WaitForChild("Map", 30)
+	local mapsFolder = Workspace:FindFirstChild("Maps")
+	local map
+	if mapsFolder then
+		map = mapsFolder:FindFirstChild("MainGameMap") or mapsFolder:FindFirstChild("LobbyMap")
+	end
+	map = map or Workspace:FindFirstChild("Map") or Workspace:WaitForChild("Map", 30)
 	if not map then
 		return nil
 	end
@@ -163,7 +168,7 @@ function WorldObjectSpawnerService.Init(_services)
 	task.spawn(function()
 		local gameplay = getGameplayFolder()
 		if not gameplay then
-			warn("[WorldObjectSpawnerService] Workspace.Map not found -- no world objects spawned.")
+			warn("[WorldObjectSpawnerService] Active map gameplay folder not found -- no world objects spawned.")
 			return
 		end
 		spawnClues(gameplay)

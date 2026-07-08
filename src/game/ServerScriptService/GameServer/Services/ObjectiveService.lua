@@ -119,4 +119,15 @@ function ObjectiveService.IsChainComplete(player)
 	return state ~= nil and currentStep(state) == nil
 end
 
+function ObjectiveService.IsQuotaMet(player)
+	local state = stateByPlayer[player]
+	if not state then
+		return false
+	end
+	local difficulty = player:GetAttribute("Difficulty") or "Easy"
+	local config = GameConfig.Difficulty[difficulty]
+	local quota = config and config.JimpitanQuota or 8
+	return state.totalDeposited >= quota
+end
+
 return ObjectiveService

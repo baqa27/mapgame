@@ -23,7 +23,12 @@ local InteractionService = {}
 local Services
 
 local function getGameplayFolder()
-	local map = Workspace:FindFirstChild("Map") or Workspace:WaitForChild("Map", 30)
+	local mapsFolder = Workspace:FindFirstChild("Maps")
+	local map
+	if mapsFolder then
+		map = mapsFolder:FindFirstChild("MainGameMap") or mapsFolder:FindFirstChild("LobbyMap")
+	end
+	map = map or Workspace:FindFirstChild("Map") or Workspace:WaitForChild("Map", 30)
 	if not map then
 		return nil
 	end

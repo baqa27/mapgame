@@ -3,8 +3,9 @@
 packaged sync script can be regenerated without needing Windows/PowerShell locally."""
 import pathlib
 
-SRC_DIR = pathlib.Path("/home/claude/work/src")
-OUTPUT_FILE = pathlib.Path("/home/claude/work/tools/sync_to_studio.lua")
+script_dir = pathlib.Path(__file__).parent.resolve()
+SRC_DIR = script_dir / "src"
+OUTPUT_FILE = script_dir / "tools" / "sync_to_studio.lua"
 
 PREFIXES = [
     ("game/ServerScriptService/GameServer/", "game.ServerScriptService.GameServer."),
