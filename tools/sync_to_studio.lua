@@ -30,6 +30,8 @@ local CheckpointService = require(ServiceScripts.CheckpointService)
 local CaseGenerationService = require(ServiceScripts.CaseGenerationService)
 local AccusationService = require(ServiceScripts.AccusationService)
 local NightTimerService = require(ServiceScripts.NightTimerService)
+local JimpitanSpawnerService = require(ServiceScripts.JimpitanSpawnerService)
+local WorldObjectSpawnerService = require(ServiceScripts.WorldObjectSpawnerService)
 local InteractionService = require(ServiceScripts.InteractionService)
 
 -- Shared registry passed into every Service.Init() so Services can call each other
@@ -47,6 +49,8 @@ local ServiceRegistry = {
 	CaseGenerationService = CaseGenerationService,
 	AccusationService = AccusationService,
 	NightTimerService = NightTimerService,
+	JimpitanSpawnerService = JimpitanSpawnerService,
+	WorldObjectSpawnerService = WorldObjectSpawnerService,
 	InteractionService = InteractionService,
 }
 
@@ -63,6 +67,8 @@ local INIT_ORDER = {
 	"CaseGenerationService",
 	"AccusationService",
 	"NightTimerService",
+	"JimpitanSpawnerService", -- spawns world content
+	"WorldObjectSpawnerService", -- spawns world content
 	"InteractionService", -- last: wires ProximityPrompts to every Service above
 }
 
@@ -95,6 +101,12 @@ local function onPlayerAdded(player)
 	HorrorService.InitPlayer(player)
 	EntityAIService.InitPlayer(player)
 	NightTimerService.InitPlayer(player, difficulty)
+
+	-- World content spawns asynchronously (waits for Workspace.Map); give it a moment
+	-- before snapshotting, otherwise a player who joins instantly could get an empty list.
+	task.defer(function()
+		JimpitanSpawnerService.SendSnapshot(player)
+	end)
 end
 
 local function onPlayerRemoving(player)
@@ -126,16 +138,15 @@ print("[GameServer] Bootstrap complete.")
         content = [====[-- ServerScriptService/GameServer/Services/AccusationService.lua
 -- Resolves accusations into endings, per DESIGN_BRIEF.md's Ending Rules and
 -- game_naratif.md's Easy/Medium/Hard branches. The actual "who's guilty" answer comes
--- from CaseGenerationService's randomly generated per-player case -- NOT a static
--- lookup -- so replaying the same difficulty can point at a different suspect each time.
--- Hard mode requires BOTH a human and a pesugihan culprit to be caught (across separate
--- accusations) before it counts as fully solved; catching only one records "partial"
--- progress and keeps the game open.
+-- from CaseGenerationService's randomly generated per-player case -- never a static
+-- lookup. Hard mode requires BOTH a human and a pesugihan culprit to be caught; a
+-- suspect flagged "human_and_pesugihan" (today: only possible outcome, see
+-- CaseGenerationService's content note) satisfies both with a single accusation.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Modules = ReplicatedStorage:WaitForChild("Modules")
 local GameConfig = require(Modules.GameConfig)
-local NarrativeData = require(Modules.NarrativeData)
+local InvestigationData = require(Modules.Data.InvestigationData)
 local RemoteRegistry = require(Modules.Net.RemoteRegistry)
 
 local AccusationService = {}
@@ -163,11 +174,32 @@ function AccusationService.RemovePlayer(player)
 end
 
 -- Called by InteractionService when the `accusation_board` ProximityPrompt is triggered.
--- Sends the suspect roster + eligibility pool only -- never the actual solution.
+-- Sends the suspect roster + profile blurb (safe -- profile text is flavor, not a
+-- guilt/innocence tell) -- never the actual solution.
 function AccusationService.OpenBoard(player)
-	RemoteRegistry.Get("Accusation/Open"):FireClient(player, {
-		suspects = NarrativeData.Suspects,
-	})
+	local suspects = {}
+	for suspectId, suspect in pairs(InvestigationData.Suspects) do
+		table.insert(suspects, {
+			id = suspectId,
+			name = suspect.displayName,
+			profile = suspect.profile,
+		})
+	end
+	table.sort(suspects, function(a, b)
+		return a.name < b.name
+	end)
+	RemoteRegistry.Get("Accusation/Open"):FireClient(player, { suspects = suspects })
+end
+
+local function markCaught(caught, culpritType)
+	if culpritType == "human" then
+		caught.human = true
+	elseif culpritType == "pesugihan" then
+		caught.pesugihan = true
+	elseif culpritType == "human_and_pesugihan" then
+		caught.human = true
+		caught.pesugihan = true
+	end
 end
 
 function AccusationService.Submit(player, suspectId)
@@ -184,9 +216,10 @@ function AccusationService.Submit(player, suspectId)
 	local culpritType = Services.CaseGenerationService.GetCulpritType(player, suspectId)
 
 	if difficulty == "Easy" then
-		if culpritType == "human" then
+		if culpritType == "human" or culpritType == "human_and_pesugihan" then
 			Services.SaveService.RecordEnding(player, GameConfig.Ending.Easy)
 			Services.SaveService.UnlockDifficulty(player, "Medium")
+			Services.ObjectiveService.ReportProgress(player, GameConfig.Objectives.Types.DETERMINE_SUSPECT, 1)
 			RemoteRegistry.Get("Accusation/Result"):FireClient(player, {
 				outcome = "correct",
 				endingId = GameConfig.Ending.Easy,
@@ -199,14 +232,16 @@ function AccusationService.Submit(player, suspectId)
 	end
 
 	if difficulty == "Medium" then
-		if culpritType == "human" then
+		if culpritType == "human" or culpritType == "human_and_pesugihan" then
 			Services.SaveService.RecordEnding(player, GameConfig.Ending.MediumHuman)
+			Services.ObjectiveService.ReportProgress(player, GameConfig.Objectives.Types.DETERMINE_SUSPECT, 1)
 			RemoteRegistry.Get("Accusation/Result"):FireClient(player, {
 				outcome = "correct",
 				endingId = GameConfig.Ending.MediumHuman,
 			})
 		elseif culpritType == "pesugihan" then
 			Services.SaveService.RecordEnding(player, GameConfig.Ending.MediumPesugihan)
+			Services.ObjectiveService.ReportProgress(player, GameConfig.Objectives.Types.DETERMINE_SUSPECT, 1)
 			RemoteRegistry.Get("Accusation/Result"):FireClient(player, {
 				outcome = "correct",
 				endingId = GameConfig.Ending.MediumPesugihan,
@@ -218,27 +253,25 @@ function AccusationService.Submit(player, suspectId)
 		return
 	end
 
-	-- Hard mode: both culprit types must be found across separate accusations.
+	-- Hard mode: both culprit types must be found (a single "human_and_pesugihan"
+	-- accusation satisfies both at once).
 	local caught = caughtByPlayer[player]
-	if culpritType == "human" then
-		caught.human = true
-	elseif culpritType == "pesugihan" then
-		caught.pesugihan = true
-	else
+	if culpritType == nil then
 		Services.TrustService.Adjust(player, GameConfig.Trust.Delta.WrongAccusationOfNPC, difficulty)
 		RemoteRegistry.Get("Accusation/Result"):FireClient(player, { outcome = "wrong", endingId = nil })
 		return
 	end
+	markCaught(caught, culpritType)
 
 	if caught.human and caught.pesugihan then
 		Services.SaveService.RecordEnding(player, GameConfig.Ending.HardFull)
 		Services.SaveService.SetFreeModeUnlocked(player, true)
+		Services.ObjectiveService.ReportProgress(player, GameConfig.Objectives.Types.DETERMINE_SUSPECT, 1)
 		RemoteRegistry.Get("Accusation/Result"):FireClient(player, {
 			outcome = "correct_full",
 			endingId = GameConfig.Ending.HardFull,
 		})
 	else
-		-- Only one culprit found so far -- game stays open, no ending screen yet.
 		RemoteRegistry.Get("Accusation/Result"):FireClient(player, {
 			outcome = "correct_partial",
 			endingId = nil,
@@ -254,21 +287,27 @@ return AccusationService
         className = "ModuleScript",
         content = [====[-- ServerScriptService/GameServer/Services/CaseGenerationService.lua
 -- Randomly generates each player's "solution" for the night, once per session, so the
--- guilty suspect(s) are NOT hardcoded and differ between playthroughs. This is the
--- system requested for: "Easy = selalu manusia (dipilih acak dari kandidat), Medium =
--- acak antara Story ID 1 (manusia) / Story ID 2 (pesugihan), Hard = butuh menangkap DUA
--- pelaku (satu manusia + satu pesugihan), keduanya dipilih acak dari kandidat masing-
--- masing." None of the source design docs specify random assignment explicitly (they
--- only describe the two Medium story branches and Hard's "must catch every culprit"
--- rule) -- this Service is the concrete system that makes it actually random per match,
--- built on top of those documented rules.
+-- guilty suspect(s) are NOT hardcoded and differ between playthroughs. Reads eligibility
+-- from InvestigationData.Suspects' `isHumanCulprit` / `isPesugihanActor` flags -- a pool,
+-- not a fixed answer.
+--
+-- IMPORTANT CONTENT NOTE: as of this writing, InvestigationData.Suspects only has ONE
+-- suspect (pak_joko) flagged eligible for either role -- every other suspect (mas_agus,
+-- mbah_darmo, bu_ani) is explicitly written as innocent, with clues/dialogue that only
+-- make narrative sense if Pak Joko is guilty (muddy_sandals is literally "di gang rumah
+-- Pak Joko", debt_note is "di warung Pak Joko"). So right now this system will always
+-- resolve to Pak Joko -- it's a pool of one, not because randomization is broken, but
+-- because only one suspect has guilt-supporting content written. To get real
+-- session-to-session variety, add 2-3 more suspects to InvestigationData.Suspects with
+-- isHumanCulprit/isPesugihanActor = true AND matching clues/dialogue that point at them
+-- specifically -- no code change needed here when you do.
 --
 -- The generated case is NEVER sent to the client in any form. AccusationService is the
 -- only thing that reads it, to compare a player's accusation against the answer.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Modules = ReplicatedStorage:WaitForChild("Modules")
-local NarrativeData = require(Modules.NarrativeData)
+local InvestigationData = require(Modules.Data.InvestigationData)
 
 local CaseGenerationService = {}
 
@@ -279,20 +318,19 @@ function CaseGenerationService.Init(_services) end
 
 local function poolFor(role)
 	local pool = {}
-	for _, suspect in ipairs(NarrativeData.Suspects) do
-		for _, eligible in ipairs(suspect.eligibleRoles) do
-			if eligible == role then
-				table.insert(pool, suspect.id)
-				break
-			end
+	local flag = role == "human" and "isHumanCulprit" or "isPesugihanActor"
+	for suspectId, suspect in pairs(InvestigationData.Suspects) do
+		if suspect[flag] then
+			table.insert(pool, suspectId)
 		end
 	end
+	table.sort(pool) -- deterministic ordering before the random pick, for reproducible tests
 	return pool
 end
 
 local function pickRandom(pool)
 	if #pool == 0 then
-		warn("[CaseGenerationService] No eligible suspects for this role -- check NarrativeData.Suspects")
+		warn("[CaseGenerationService] No eligible suspects for this role -- check InvestigationData.Suspects")
 		return nil
 	end
 	return pool[math.random(1, #pool)]
@@ -305,32 +343,45 @@ function CaseGenerationService.GenerateCase(player, difficulty)
 	local branch = nil
 
 	if difficulty == "Easy" then
-		-- Easy is always a normal human thief (per DESIGN_BRIEF.md/GAME LAVEL.md) --
-		-- WHICH suspect is picked at random from the eligible pool for replayability.
 		local humanId = pickRandom(poolFor("human"))
 		if humanId then
 			culpritBySuspectId[humanId] = "human"
 		end
 	elseif difficulty == "Medium" then
-		-- 50/50 which story branch is true this session: Story ID 1 (human) or
-		-- Story ID 2 (pesugihan), per game_naratif.md's two Medium endings.
 		branch = (math.random() < 0.5) and "human" or "pesugihan"
 		local suspectId = pickRandom(poolFor(branch))
 		if suspectId then
 			culpritBySuspectId[suspectId] = branch
 		end
 	else -- Hard
-		-- Hard always needs BOTH a human culprit and a pesugihan culprit caught
-		-- (game_naratif.md: "harus mengungkap seluruh pelaku, baik pencuri manusia
-		-- maupun pihak yang terlibat dalam praktik pesugihan"). Each is picked
-		-- independently at random from its own pool.
 		local humanId = pickRandom(poolFor("human"))
-		local pesugihanId = pickRandom(poolFor("pesugihan"))
-		if humanId then
-			culpritBySuspectId[humanId] = "human"
+		local pesugihanPool = poolFor("pesugihan")
+
+		-- Prefer two DISTINCT suspects when the content pool supports it; fall back to
+		-- one suspect covering both roles (today's reality: only pak_joko is eligible
+		-- for either) rather than silently making Hard mode unsolvable.
+		local pesugihanId
+		if humanId and #pesugihanPool > 1 then
+			local filtered = {}
+			for _, id in ipairs(pesugihanPool) do
+				if id ~= humanId then
+					table.insert(filtered, id)
+				end
+			end
+			pesugihanId = pickRandom(filtered)
+		else
+			pesugihanId = pickRandom(pesugihanPool)
 		end
-		if pesugihanId then
-			culpritBySuspectId[pesugihanId] = "pesugihan"
+
+		if humanId and humanId == pesugihanId then
+			culpritBySuspectId[humanId] = "human_and_pesugihan"
+		else
+			if humanId then
+				culpritBySuspectId[humanId] = "human"
+			end
+			if pesugihanId then
+				culpritBySuspectId[pesugihanId] = "pesugihan"
+			end
 		end
 	end
 
@@ -344,10 +395,8 @@ function CaseGenerationService.RemovePlayer(player)
 	caseByPlayer[player] = nil
 end
 
--- Returns "human" | "pesugihan" | nil (innocent) for the given suspectId, per this
--- player's randomly generated case. This is the ONLY place AccusationService should
--- read "who's actually guilty" from -- never read NarrativeData.Suspects directly for
--- that, its eligibleRoles field is a pool, not an answer.
+-- Returns "human" | "pesugihan" | "human_and_pesugihan" | nil (innocent) for the given
+-- suspectId, per this player's randomly generated case.
 function CaseGenerationService.GetCulpritType(player, suspectId)
 	local case = caseByPlayer[player]
 	if not case then
@@ -356,9 +405,7 @@ function CaseGenerationService.GetCulpritType(player, suspectId)
 	return case.culpritBySuspectId[suspectId]
 end
 
--- Medium-only: which branch ("human" | "pesugihan") this session's true story is. Not
--- currently consumed anywhere, but useful if DialogueService/HorrorService later want to
--- bias flavor content toward whichever branch is actually true this session.
+-- Medium-only: which branch ("human" | "pesugihan") this session's true story is.
 function CaseGenerationService.GetBranch(player)
 	local case = caseByPlayer[player]
 	return case and case.branch
@@ -453,16 +500,23 @@ return CheckpointService
         path = "game.ServerScriptService.GameServer.Services.DialogueService",
         className = "ModuleScript",
         content = [====[-- ServerScriptService/GameServer/Services/DialogueService.lua
--- Branching NPC dialogue driven entirely by NarrativeData. `Dialogue/Start` is called
--- directly by InteractionService when an `npc` ProximityPrompt fires (no remote needed);
+-- Branching NPC dialogue driven by DialogueData.lua. `Start` is called directly by
+-- InteractionService when an `npc` ProximityPrompt fires (no remote needed);
 -- `Dialogue/Choose` is the one client->server remote, used for follow-up choices once a
--- dialogue box is already open. A choice can optionally carry a `TrustDelta` (see
--- NarrativeData) -- game_mechanics.md's Player Actions table explicitly lists Dialogue
--- Choice as affecting trust, so this Service is where that hook lives.
+-- dialogue box is already open.
+--
+-- DialogueData schema per node: `line` (text), `requiredTrust` (optional node-level
+-- gate -- if unmet, the NPC's `locked` node is shown instead, if one exists), and
+-- `choices[]` each with: `text`, `nextNode` (or `close = true` to end), `requiredTrust`,
+-- `requiredClue`, `grantClue` (auto-collects a clue via InvestigationData), `trustAction`
+-- (a named delta from GameConfig.Trust.Actions), and `objectiveProgress` (a step id/type
+-- reported to ObjectiveService).
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Modules = ReplicatedStorage:WaitForChild("Modules")
-local NarrativeData = require(Modules.NarrativeData)
+local GameConfig = require(Modules.GameConfig)
+local DialogueData = require(Modules.Data.DialogueData)
+local InvestigationData = require(Modules.Data.InvestigationData)
 local RemoteRegistry = require(Modules.Net.RemoteRegistry)
 
 local DialogueService = {}
@@ -483,40 +537,48 @@ function DialogueService.Init(services)
 	end)
 end
 
-local function isChoiceLocked(player, choice)
-	if not choice.Requires then
-		return false, nil
+local function meetsTrust(player, requiredTrust)
+	if not requiredTrust then
+		return true
 	end
-	if choice.Requires.ClueId and not Services.InvestigationService.HasClue(player, choice.Requires.ClueId) then
+	local currentState = Services.TrustService.GetState(player)
+	return (TRUST_ORDER[currentState] or 0) >= (TRUST_ORDER[requiredTrust] or 0)
+end
+
+local function isChoiceLocked(player, choice)
+	if choice.requiredClue and not Services.InvestigationService.HasClue(player, choice.requiredClue) then
 		return true, "Kamu belum menemukan petunjuk yang cukup."
 	end
-	if choice.Requires.Trust then
-		local currentState = Services.TrustService.GetState(player)
-		if (TRUST_ORDER[currentState] or 0) < (TRUST_ORDER[choice.Requires.Trust] or 0) then
-			return true, "Warga belum cukup percaya padamu."
-		end
+	if choice.requiredTrust and not meetsTrust(player, choice.requiredTrust) then
+		return true, "Warga belum cukup percaya padamu."
 	end
 	return false, nil
 end
 
 local function sendNode(player, npcId, nodeId)
-	local npc = NarrativeData.NPCs[npcId]
-	if not npc then
+	local dialogue = DialogueData.GetDialogue(npcId)
+	if not dialogue then
 		return
 	end
-	local node = npc.Nodes[nodeId]
+	local node = dialogue.nodes[nodeId]
 	if not node then
+		return
+	end
+
+	-- Node-level trust gate: redirect to a "locked" node if this NPC defines one.
+	if node.requiredTrust and not meetsTrust(player, node.requiredTrust) and dialogue.nodes.locked and nodeId ~= "locked" then
+		sendNode(player, npcId, "locked")
 		return
 	end
 
 	currentNodeByPlayer[player] = { npcId = npcId, nodeId = nodeId }
 
 	local choicesPayload = {}
-	for _, choice in ipairs(node.Choices) do
+	for _, choice in ipairs(node.choices) do
 		local locked, reason = isChoiceLocked(player, choice)
 		table.insert(choicesPayload, {
-			id = choice.Id,
-			text = choice.Text,
+			id = choice.id,
+			text = choice.text,
 			locked = locked,
 			lockedReason = reason,
 		})
@@ -524,19 +586,20 @@ local function sendNode(player, npcId, nodeId)
 
 	RemoteRegistry.Get("Dialogue/Node"):FireClient(player, {
 		nodeId = nodeId,
-		npcName = npc.DisplayName,
-		text = node.Text,
+		npcName = dialogue.displayName or npcId,
+		text = node.line,
 		choices = choicesPayload,
 	})
 end
 
+-- Called by InteractionService when an `npc` ProximityPrompt is triggered.
 function DialogueService.Start(player, npcId)
-	local npc = NarrativeData.NPCs[npcId]
-	if not npc then
+	local dialogue = DialogueData.GetDialogue(npcId)
+	if not dialogue then
 		warn("[DialogueService] Unknown NPCId:", npcId)
 		return
 	end
-	sendNode(player, npcId, npc.StartNode)
+	sendNode(player, npcId, dialogue.start)
 end
 
 function DialogueService.Choose(player, nodeId, choiceId)
@@ -544,26 +607,46 @@ function DialogueService.Choose(player, nodeId, choiceId)
 	if not current or current.nodeId ~= nodeId then
 		return -- stale/forged request; ignore
 	end
-	local npc = NarrativeData.NPCs[current.npcId]
-	local node = npc and npc.Nodes[nodeId]
+	local dialogue = DialogueData.GetDialogue(current.npcId)
+	local node = dialogue and dialogue.nodes[nodeId]
 	if not node then
 		return
 	end
 
-	for _, choice in ipairs(node.Choices) do
-		if choice.Id == choiceId then
+	for _, choice in ipairs(node.choices) do
+		if choice.id == choiceId then
 			if isChoiceLocked(player, choice) then
 				return -- client should already grey this out; server re-validates anyway
 			end
 
-			if choice.TrustDelta then
-				Services.TrustService.Adjust(player, choice.TrustDelta, player:GetAttribute("Difficulty"))
+			if choice.trustAction then
+				local delta = GameConfig.Trust.Actions[choice.trustAction]
+				if delta then
+					Services.TrustService.Adjust(player, delta, player:GetAttribute("Difficulty"))
+				else
+					warn("[DialogueService] Unknown trustAction:", choice.trustAction)
+				end
 			end
 
-			if choice.Next then
-				sendNode(player, current.npcId, choice.Next)
-			else
+			if choice.grantClue then
+				local clue = InvestigationData.GetClue(choice.grantClue)
+				Services.InvestigationService.CollectClue(
+					player,
+					choice.grantClue,
+					clue and clue.description,
+					clue and clue.isFalse == true
+				)
+			end
+
+			if choice.objectiveProgress then
+				Services.ObjectiveService.ReportProgress(player, choice.objectiveProgress, 1)
+			end
+
+			if choice.close or not choice.nextNode then
 				currentNodeByPlayer[player] = nil
+				Services.ObjectiveService.ReportProgress(player, GameConfig.Objectives.Types.TALK_NPC, 1)
+			else
+				sendNode(player, current.npcId, choice.nextNode)
 			end
 			return
 		end
@@ -694,12 +777,17 @@ return HorrorService
 -- (MaxActivationDistance) -- this Service just reads attributes and routes to the
 -- matching Service. No Controller/Remote ever bypasses this path.
 --
--- Must be Init()'d LAST in Bootstrap (after every other Service), since it calls into
--- all of them.
+-- Clue content (text, isFalse, difficulty gating) is looked up from InvestigationData by
+-- ClueId -- map parts only need to carry the id, not full flavor text as an attribute.
+--
+-- Must be Init()'d LAST in Bootstrap (after every other Service, including the world
+-- spawners), since it calls into all of them.
 
 local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Modules = ReplicatedStorage:WaitForChild("Modules")
+local GameConfig = require(Modules.GameConfig)
+local InvestigationData = require(Modules.Data.InvestigationData)
 local AttributeConstants = require(Modules.Util.AttributeConstants)
 local RemoteRegistry = require(Modules.Net.RemoteRegistry)
 
@@ -734,6 +822,24 @@ local function meetsRequirement(part, player, services)
 	return services.InvestigationService.HasClue(player, requiredClueId)
 end
 
+local function handleClue(player, part, Attrs)
+	local clueId = part:GetAttribute(Attrs.ClueId)
+	local clueData = InvestigationData.GetClue(clueId)
+	local difficulty = player:GetAttribute("Difficulty") or "Easy"
+
+	if clueData and not InvestigationData.IsClueAllowed(clueId, difficulty) then
+		return -- this clue isn't part of the active difficulty's clue set
+	end
+
+	local text = clueData and clueData.description or part:GetAttribute(Attrs.ClueText)
+	local isFalse = clueData and clueData.isFalse == true or part:GetAttribute(Attrs.FalseClue) == true
+
+	local collected = Services.InvestigationService.CollectClue(player, clueId, text, isFalse)
+	if collected then
+		Services.ObjectiveService.ReportProgress(player, GameConfig.Objectives.Types.FIND_CLUE, 1)
+	end
+end
+
 local function onTriggered(part, player)
 	if not difficultyAllows(part, player) then
 		return
@@ -750,17 +856,9 @@ local function onTriggered(part, player)
 	local Attrs = AttributeConstants.Attributes
 
 	if interactionType == Types.Jimpitan then
-		Services.ObjectiveService.AddCarriedJimpitan(player, 1)
-		-- One-time pickup; MapManager.luau (environment team's script, see
-		-- MAP_LEVEL_DESIGN_GUIDE.md) owns respawn behavior for JimpitanSpawns -- we only
-		-- consume the interaction here, we never touch the spawn part itself.
+		Services.JimpitanSpawnerService.Collect(player, part)
 	elseif interactionType == Types.Clue then
-		Services.InvestigationService.CollectClue(
-			player,
-			part:GetAttribute(Attrs.ClueId),
-			part:GetAttribute(Attrs.ClueText),
-			part:GetAttribute(Attrs.FalseClue) == true
-		)
+		handleClue(player, part, Attrs)
 	elseif interactionType == Types.NPC then
 		Services.DialogueService.Start(player, part:GetAttribute(Attrs.NPCId))
 	elseif interactionType == Types.Puzzle then
@@ -872,6 +970,154 @@ return InvestigationService
 ]====]
     },
     {
+        path = "game.ServerScriptService.GameServer.Services.JimpitanSpawnerService",
+        className = "ModuleScript",
+        content = [====[-- ServerScriptService/GameServer/Services/JimpitanSpawnerService.lua
+-- Auto-spawns one glowing, animated jimpitan pickup near each house in
+-- WorldData.Village.Houses -- this is what makes "which jimpitan do I take" obvious
+-- without the environment team hand-placing anything. Idempotent (MarkerBuilder skips
+-- creation if a same-named part already exists), so hand-placed/hand-edited jimpitan
+-- cans are never overwritten on a later server start.
+--
+-- Owns the full pickup lifecycle: collect -> hide -> respawn after a cooldown -- and
+-- broadcasts the active spawn list to every client so the minimap can show them
+-- (Free-Fire-style loot blips), since jimpitan spawns are shared/global, not per-player.
+
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+local GameConfig = require(Modules.GameConfig)
+local WorldData = require(Modules.Data.WorldData)
+local AttributeConstants = require(Modules.Util.AttributeConstants)
+local MarkerBuilder = require(Modules.Util.MarkerBuilder)
+local RemoteRegistry = require(Modules.Net.RemoteRegistry)
+
+local JimpitanSpawnerService = {}
+
+local spawnPartsById = {} -- [jimpitanId] = part
+local collectedSet = {} -- [part] = true while on cooldown
+local Services
+
+local UPRIGHT = CFrame.Angles(0, 0, math.rad(90)) -- cylinders lie on their side by default
+
+local function getOrCreateFolder()
+	local map = Workspace:FindFirstChild("Map") or Workspace:WaitForChild("Map", 30)
+	if not map then
+		return nil
+	end
+	local gameplay = map:FindFirstChild("Gameplay")
+	if not gameplay then
+		gameplay = Instance.new("Folder")
+		gameplay.Name = "Gameplay"
+		gameplay.Parent = map
+	end
+	local folder = gameplay:FindFirstChild("JimpitanSpawns")
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = "JimpitanSpawns"
+		folder.Parent = gameplay
+	end
+	return folder
+end
+
+local function spawnAll()
+	local folder = getOrCreateFolder()
+	if not folder then
+		warn("[JimpitanSpawnerService] Workspace.Map not found -- no jimpitan spawned.")
+		return
+	end
+
+	local offset = GameConfig.JimpitanSpawn.OffsetStuds
+	for _, house in ipairs(WorldData.Village.Houses) do
+		local id = house.id .. "_jimpitan"
+		local position = house.position + offset
+		local part = MarkerBuilder.EnsureMarker(folder, id, {
+			Position = position,
+			Shape = Enum.PartType.Cylinder,
+			Size = Vector3.new(1.3, 1.1, 1.1),
+			Color = Color3.fromRGB(214, 168, 74),
+			Material = Enum.Material.Metal,
+			Icon = "\240\159\170\153",
+			ActionText = "Ambil",
+			ObjectText = "Jimpitan",
+			MaxActivationDistance = 8,
+			ExtraRotation = UPRIGHT,
+			Attributes = {
+				[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.Jimpitan,
+				[AttributeConstants.Attributes.JimpitanId] = id,
+			},
+		})
+		spawnPartsById[id] = part
+	end
+end
+
+function JimpitanSpawnerService.Init(services)
+	Services = services
+	task.spawn(spawnAll)
+end
+
+function JimpitanSpawnerService.GetActiveSpawns()
+	local list = {}
+	for id, part in pairs(spawnPartsById) do
+		if part.Parent and not collectedSet[part] then
+			local pos = part.Position
+			table.insert(list, { id = id, x = pos.X, y = pos.Y, z = pos.Z })
+		end
+	end
+	return list
+end
+
+function JimpitanSpawnerService.BroadcastSpawns()
+	RemoteRegistry.Get("Jimpitan/Spawns"):FireAllClients({ spawns = JimpitanSpawnerService.GetActiveSpawns() })
+end
+
+-- Called once when a player joins, so they see currently-active spawns immediately
+-- instead of waiting for the next collect/respawn event to trigger a broadcast.
+function JimpitanSpawnerService.SendSnapshot(player)
+	RemoteRegistry.Get("Jimpitan/Spawns"):FireClient(player, { spawns = JimpitanSpawnerService.GetActiveSpawns() })
+end
+
+-- Called by InteractionService when a `jimpitan_can` ProximityPrompt is triggered.
+function JimpitanSpawnerService.Collect(player, part)
+	if collectedSet[part] then
+		return
+	end
+	collectedSet[part] = true
+
+	Services.ObjectiveService.AddCarriedJimpitan(player, 1)
+
+	part.Transparency = 1
+	local icon = part:FindFirstChild("Icon")
+	if icon then
+		icon.Enabled = false
+	end
+	local prompt = part:FindFirstChildOfClass("ProximityPrompt")
+	if prompt then
+		prompt.Enabled = false
+	end
+
+	JimpitanSpawnerService.BroadcastSpawns()
+
+	task.delay(GameConfig.JimpitanSpawn.RespawnDelaySeconds, function()
+		if not part or not part.Parent then
+			return
+		end
+		part.Transparency = 0
+		if icon then
+			icon.Enabled = true
+		end
+		if prompt then
+			prompt.Enabled = true
+		end
+		collectedSet[part] = nil
+		JimpitanSpawnerService.BroadcastSpawns()
+	end)
+end
+
+return JimpitanSpawnerService
+]====]
+    },
+    {
         path = "game.ServerScriptService.GameServer.Services.NightTimerService",
         className = "ModuleScript",
         content = [====[-- ServerScriptService/GameServer/Services/NightTimerService.lua
@@ -931,86 +1177,124 @@ return NightTimerService
         path = "game.ServerScriptService.GameServer.Services.ObjectiveService",
         className = "ModuleScript",
         content = [====[-- ServerScriptService/GameServer/Services/ObjectiveService.lua
--- Tracks the global cooperative objective chain per difficulty. Jimpitan collection is
--- two-phase, matching GAME_LAVEL.md's "Main Action": pick up jimpitan around the village
--- (carried, not yet counted) THEN deposit it at a checkpoint/Pos Ronda (progress) --
--- this is deliberately where the "money disappears" mystery lives narratively.
+-- Tracks the per-difficulty objective CHAIN from ObjectiveData.lua (brief -> collect
+-- jimpitan -> find clues -> talk to witnesses -> accuse), one step active at a time.
+-- Jimpitan collection stays two-phase: pick up (carried) THEN deposit at any checkpoint
+-- (counts toward whichever step is active, plus a lifetime total) -- matches GAME
+-- LAVEL.md's Easy Mode "Main Action": collect jimpitan, THEN store it at Pos Ronda.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Modules = ReplicatedStorage:WaitForChild("Modules")
 local GameConfig = require(Modules.GameConfig)
+local ObjectiveData = require(Modules.Data.ObjectiveData)
+local WorldData = require(Modules.Data.WorldData)
 local RemoteRegistry = require(Modules.Net.RemoteRegistry)
 
 local ObjectiveService = {}
 
-local progressByPlayer = {}
+local stateByPlayer = {} -- [player] = { chain, stepIndex, stepProgress, carried, totalDeposited }
+local Services
 
-function ObjectiveService.Init(_services) end
+function ObjectiveService.Init(services)
+	Services = services
+end
 
 function ObjectiveService.InitPlayer(player, difficulty)
-	local tier = GameConfig.Difficulty[difficulty] or GameConfig.Difficulty.Easy
-	progressByPlayer[player] = {
-		progress = 0,
-		target = tier.JimpitanQuota,
+	stateByPlayer[player] = {
+		chain = ObjectiveData.GetChain(difficulty),
+		stepIndex = 1,
+		stepProgress = 0,
 		carried = 0,
-		label = "Kumpulkan jimpitan",
+		totalDeposited = 0,
 	}
 	ObjectiveService.Broadcast(player)
 end
 
 function ObjectiveService.RemovePlayer(player)
-	progressByPlayer[player] = nil
+	stateByPlayer[player] = nil
+end
+
+local function currentStep(state)
+	return state.chain[state.stepIndex]
 end
 
 function ObjectiveService.Broadcast(player)
-	local data = progressByPlayer[player]
-	if not data then
+	local state = stateByPlayer[player]
+	if not state then
 		return
 	end
+	local step = currentStep(state)
 	RemoteRegistry.Get("Objective/StateChanged"):FireClient(player, {
-		label = data.label,
-		progress = data.progress,
-		target = data.target,
-		carried = data.carried,
+		title = step and step.title or "Ronda selesai",
+		description = step and step.description or "Semua tahap malam ini sudah kamu selesaikan.",
+		progress = step and state.stepProgress or 0,
+		target = step and step.target or 0,
+		stepIndex = state.stepIndex,
+		stepCount = #state.chain,
+		carried = state.carried,
+		chainComplete = step == nil,
 	})
 end
 
--- Called by InteractionService when a `jimpitan_can` ProximityPrompt is triggered. Does
--- NOT count toward the objective yet -- see DepositCarriedJimpitan.
+-- Advances the CURRENT step only if `stepIdOrType` matches its `id` or its `type`.
+-- Callers can report either an exact step id (DialogueData's `objectiveProgress` field)
+-- or a generic type (GameConfig.Objectives.Types.*, used by jimpitan/clue/puzzle/talk
+-- flows that aren't tied to one specific step id).
+function ObjectiveService.ReportProgress(player, stepIdOrType, amount)
+	local state = stateByPlayer[player]
+	if not state then
+		return
+	end
+	local step = currentStep(state)
+	if not step then
+		return -- chain already complete
+	end
+	if step.id ~= stepIdOrType and step.type ~= stepIdOrType then
+		return -- not relevant to the currently active step
+	end
+
+	state.stepProgress = math.min(step.target, state.stepProgress + (amount or 1))
+
+	if state.stepProgress >= step.target then
+		if step.checkpoint and Services and Services.CheckpointService then
+			local position = WorldData.Village.Checkpoints[step.checkpoint]
+			Services.CheckpointService.Reach(player, step.checkpoint, position and CFrame.new(position) or nil)
+		end
+		state.stepIndex = state.stepIndex + 1
+		state.stepProgress = 0
+	end
+
+	ObjectiveService.Broadcast(player)
+end
+
+-- Called by JimpitanSpawnerService when a player picks up a jimpitan can. NOT counted
+-- toward the objective yet -- see DepositCarriedJimpitan.
 function ObjectiveService.AddCarriedJimpitan(player, amount)
-	local data = progressByPlayer[player]
-	if not data then
+	local state = stateByPlayer[player]
+	if not state then
 		return
 	end
-	data.carried = data.carried + (amount or 1)
+	state.carried = state.carried + (amount or 1)
 	ObjectiveService.Broadcast(player)
 end
 
--- Called by CheckpointService whenever the player reaches ANY checkpoint (Pos Ronda or
--- otherwise) -- converts carried jimpitan into real objective progress.
+-- Called by CheckpointService whenever the player reaches ANY checkpoint -- converts
+-- carried jimpitan into real progress (both a lifetime total, and the active step's
+-- progress if it happens to be a COLLECT_JIMPITAN step).
 function ObjectiveService.DepositCarriedJimpitan(player)
-	local data = progressByPlayer[player]
-	if not data or data.carried <= 0 then
+	local state = stateByPlayer[player]
+	if not state or state.carried <= 0 then
 		return
 	end
-	local amount = data.carried
-	data.carried = 0
-	data.progress = math.min(data.target, data.progress + amount)
-	ObjectiveService.Broadcast(player)
+	local amount = state.carried
+	state.carried = 0
+	state.totalDeposited = state.totalDeposited + amount
+	ObjectiveService.ReportProgress(player, GameConfig.Objectives.Types.COLLECT_JIMPITAN, amount)
 end
 
-function ObjectiveService.SetLabel(player, label)
-	local data = progressByPlayer[player]
-	if not data then
-		return
-	end
-	data.label = label
-	ObjectiveService.Broadcast(player)
-end
-
-function ObjectiveService.IsQuotaMet(player)
-	local data = progressByPlayer[player]
-	return data ~= nil and data.progress >= data.target
+function ObjectiveService.IsChainComplete(player)
+	local state = stateByPlayer[player]
+	return state ~= nil and currentStep(state) == nil
 end
 
 return ObjectiveService
@@ -1020,31 +1304,21 @@ return ObjectiveService
         path = "game.ServerScriptService.GameServer.Services.PuzzleService",
         className = "ModuleScript",
         content = [====[-- ServerScriptService/GameServer/Services/PuzzleService.lua
--- Observation-puzzle framework. Implements ONE full puzzle type end-to-end (a
--- multiple-choice "spot the anomaly" puzzle), per MAIN_GAME_SYSTEM_RULES.md Build Order
--- step 7 -- add more entries to `Puzzles` below as new PuzzleId markers are attached to
--- interactables in Workspace.Map.Gameplay.Puzzles. No client/Controller changes are
--- needed to add a new puzzle of this type.
+-- Sequence-recall puzzles ("repeat the pattern"), driven by InvestigationData.Puzzles
+-- (each has a `sequence` of small integers, e.g. kentongan_pattern = {2,1,3}). The demo
+-- sequence IS sent to the client for playback (needed so the client can show/animate it)
+-- -- submission is still validated server-side, so this only exposes "the answer to this
+-- one puzzle, once opened," not any core game secret (accusation solutions stay
+-- server-only). Tighten this later with server-timed in-world audio/light cues instead
+-- of a raw payload if you want zero exposure.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Modules = ReplicatedStorage:WaitForChild("Modules")
+local GameConfig = require(Modules.GameConfig)
+local InvestigationData = require(Modules.Data.InvestigationData)
 local RemoteRegistry = require(Modules.Net.RemoteRegistry)
 
 local PuzzleService = {}
-
-local Puzzles = {
-	rumah_02_jejak = {
-		Question = "Mana jejak kaki yang tidak cocok dengan pola warga lain di rumah ini?",
-		Options = {
-			{ id = "a", text = "Jejak sandal, mengarah ke dapur" },
-			{ id = "b", text = "Jejak sepatu bot, mengarah ke pagar belakang" },
-			{ id = "c", text = "Jejak kaki telanjang, melingkar di teras" },
-		},
-		AnswerId = "b",
-		RewardClueId = "jejak_sepatu_bot",
-		RewardClueText = "Jejak sepatu bot menuju pagar belakang -- bukan pola warga biasa.",
-	},
-}
 
 local activePuzzleByPlayer = {}
 local Services
@@ -1053,7 +1327,7 @@ function PuzzleService.Init(services)
 	Services = services
 
 	RemoteRegistry.Get("Puzzle/Submit").OnServerEvent:Connect(function(player, payload)
-		if typeof(payload) ~= "table" then
+		if typeof(payload) ~= "table" or typeof(payload.answer) ~= "table" then
 			return
 		end
 		PuzzleService.Submit(player, payload.puzzleId, payload.answer)
@@ -1062,40 +1336,70 @@ end
 
 -- Called by InteractionService when a `puzzle` ProximityPrompt is triggered.
 function PuzzleService.Open(player, puzzleId)
-	local puzzle = Puzzles[puzzleId]
+	local puzzle = InvestigationData.Puzzles[puzzleId]
 	if not puzzle then
 		warn("[PuzzleService] Unknown PuzzleId:", puzzleId)
 		return
 	end
+
 	activePuzzleByPlayer[player] = puzzleId
+
+	local symbolCount = 0
+	for _, value in ipairs(puzzle.sequence) do
+		symbolCount = math.max(symbolCount, value)
+	end
+
 	RemoteRegistry.Get("Puzzle/Data"):FireClient(player, {
 		puzzleId = puzzleId,
-		question = puzzle.Question,
-		options = puzzle.Options,
+		displayName = puzzle.displayName,
+		description = puzzle.description,
+		symbolCount = symbolCount,
+		sequence = puzzle.sequence, -- client uses this only to animate the demo playback
 	})
 end
 
-function PuzzleService.Submit(player, puzzleId, answerId)
+local function sequencesMatch(a, b)
+	if typeof(a) ~= "table" or #a ~= #b then
+		return false
+	end
+	for i, value in ipairs(b) do
+		if a[i] ~= value then
+			return false
+		end
+	end
+	return true
+end
+
+function PuzzleService.Submit(player, puzzleId, answer)
 	if activePuzzleByPlayer[player] ~= puzzleId then
 		return -- no active puzzle matching this id; ignore forged/stale submit
 	end
-	local puzzle = Puzzles[puzzleId]
+	local puzzle = InvestigationData.Puzzles[puzzleId]
 	if not puzzle then
 		return
 	end
 
-	local success = answerId == puzzle.AnswerId
+	local success = sequencesMatch(answer, puzzle.sequence)
 	activePuzzleByPlayer[player] = nil
 
 	if success then
-		Services.InvestigationService.CollectClue(player, puzzle.RewardClueId, puzzle.RewardClueText, false)
+		if puzzle.rewardClue then
+			local clue = InvestigationData.GetClue(puzzle.rewardClue)
+			Services.InvestigationService.CollectClue(
+				player,
+				puzzle.rewardClue,
+				clue and clue.description,
+				clue and clue.isFalse == true
+			)
+		end
+		Services.ObjectiveService.ReportProgress(player, GameConfig.Objectives.Types.SOLVE_PUZZLE, 1)
 	else
 		Services.CheckpointService.ReportInvestigationFailure(player)
 	end
 
 	RemoteRegistry.Get("Puzzle/Result"):FireClient(player, {
 		success = success,
-		rewardClueId = success and puzzle.RewardClueId or nil,
+		rewardClueId = success and puzzle.rewardClue or nil,
 	})
 end
 
@@ -1322,6 +1626,188 @@ return TrustService
 ]====]
     },
     {
+        path = "game.ServerScriptService.GameServer.Services.WorldObjectSpawnerService",
+        className = "ModuleScript",
+        content = [====[-- ServerScriptService/GameServer/Services/WorldObjectSpawnerService.lua
+-- Auto-spawns clue markers, puzzle stations, NPC stands, checkpoint pads, and the
+-- accusation board, all from WorldData.Village's real coordinates -- the environment
+-- team's map only needs house/terrain geometry; this Service fills in the gameplay
+-- layer. Idempotent (see MarkerBuilder) so hand-placed/hand-edited objects are never
+-- overwritten on a later server start.
+
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+local WorldData = require(Modules.Data.WorldData)
+local DialogueData = require(Modules.Data.DialogueData)
+local InvestigationData = require(Modules.Data.InvestigationData)
+local AttributeConstants = require(Modules.Util.AttributeConstants)
+local MarkerBuilder = require(Modules.Util.MarkerBuilder)
+
+local WorldObjectSpawnerService = {}
+
+local FLAT = CFrame.Angles(0, 0, math.rad(90)) -- cylinders lie on their side by default
+
+local function getGameplayFolder()
+	local map = Workspace:FindFirstChild("Map") or Workspace:WaitForChild("Map", 30)
+	if not map then
+		return nil
+	end
+	local gameplay = map:FindFirstChild("Gameplay")
+	if not gameplay then
+		gameplay = Instance.new("Folder")
+		gameplay.Name = "Gameplay"
+		gameplay.Parent = map
+	end
+	return gameplay
+end
+
+local function getOrCreateSubfolder(gameplay, name)
+	local folder = gameplay:FindFirstChild(name)
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = name
+		folder.Parent = gameplay
+	end
+	return folder
+end
+
+local function spawnClues(gameplay)
+	local folder = getOrCreateSubfolder(gameplay, "Clues")
+	for _, clue in ipairs(WorldData.Village.Clues) do
+		local data = InvestigationData.GetClue(clue.id)
+		MarkerBuilder.EnsureMarker(folder, clue.id, {
+			Position = clue.position,
+			Shape = Enum.PartType.Ball,
+			Size = Vector3.new(1, 1, 1),
+			Color = Color3.fromRGB(140, 200, 235),
+			Material = Enum.Material.Neon,
+			Icon = "\240\159\148\141",
+			ActionText = "Periksa",
+			ObjectText = data and data.displayName or "Petunjuk",
+			MaxActivationDistance = 8,
+			Attributes = {
+				[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.Clue,
+				[AttributeConstants.Attributes.ClueId] = clue.id,
+			},
+		})
+	end
+end
+
+local function spawnPuzzles(gameplay)
+	local folder = getOrCreateSubfolder(gameplay, "Puzzles")
+	for _, puzzle in ipairs(WorldData.Village.Puzzles) do
+		local data = InvestigationData.Puzzles[puzzle.id]
+		local attrs = {
+			[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.Puzzle,
+			[AttributeConstants.Attributes.PuzzleId] = puzzle.id,
+		}
+		if data and data.requiredDifficulty then
+			attrs[AttributeConstants.Attributes.DifficultyOnly] = data.requiredDifficulty
+		end
+		MarkerBuilder.EnsureMarker(folder, puzzle.id, {
+			Position = puzzle.position,
+			Shape = Enum.PartType.Block,
+			Size = Vector3.new(1.6, 1.6, 1.6),
+			Color = Color3.fromRGB(170, 120, 220),
+			Material = Enum.Material.Neon,
+			Icon = "\240\159\167\169",
+			ActionText = "Pecahkan",
+			ObjectText = data and data.displayName or "Teka-teki",
+			MaxActivationDistance = 9,
+			Attributes = attrs,
+		})
+	end
+end
+
+local function spawnNPCs(gameplay)
+	local folder = getOrCreateSubfolder(gameplay, "NPCs")
+	for _, npc in ipairs(WorldData.Village.NPCs) do
+		local dialogue = DialogueData.GetDialogue(npc.id)
+		MarkerBuilder.EnsureMarker(folder, npc.id, {
+			Position = npc.position,
+			Shape = Enum.PartType.Block,
+			Size = Vector3.new(2, 5.5, 0.4),
+			Color = Color3.fromRGB(90, 130, 110),
+			Material = Enum.Material.ForceField,
+			NameLabel = dialogue and dialogue.displayName or npc.label,
+			ActionText = "Bicara",
+			ObjectText = dialogue and dialogue.displayName or "Warga",
+			MaxActivationDistance = 9,
+			Bob = false,
+			Attributes = {
+				[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.NPC,
+				[AttributeConstants.Attributes.NPCId] = npc.id,
+			},
+		})
+	end
+end
+
+local function spawnCheckpoints(gameplay)
+	local folder = getOrCreateSubfolder(gameplay, "Checkpoints")
+	for id, position in pairs(WorldData.Village.Checkpoints) do
+		MarkerBuilder.EnsureMarker(folder, id, {
+			Position = position,
+			Shape = Enum.PartType.Cylinder,
+			Size = Vector3.new(0.3, 6, 6),
+			Color = Color3.fromRGB(232, 168, 85),
+			Material = Enum.Material.Neon,
+			Icon = "\240\159\143\174",
+			ActionText = "Lapor",
+			ObjectText = "Checkpoint",
+			MaxActivationDistance = 12,
+			Bob = false,
+			ExtraRotation = FLAT,
+			Attributes = {
+				[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.Checkpoint,
+				[AttributeConstants.Attributes.CheckpointId] = id,
+			},
+		})
+	end
+end
+
+local function spawnAccusationBoard(gameplay)
+	local folder = getOrCreateSubfolder(gameplay, "Interactables")
+	local position = WorldData.Village.Checkpoints.ending_choice
+	if not position then
+		return
+	end
+	MarkerBuilder.EnsureMarker(folder, "accusation_board", {
+		Position = position + Vector3.new(6, 1, 0),
+		Shape = Enum.PartType.Block,
+		Size = Vector3.new(3, 3.5, 1),
+		Color = Color3.fromRGB(150, 40, 40),
+		Material = Enum.Material.Neon,
+		Icon = "\226\154\150",
+		ActionText = "Buka",
+		ObjectText = "Papan Tuduhan",
+		MaxActivationDistance = 10,
+		Bob = false,
+		Attributes = {
+			[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.AccusationBoard,
+		},
+	})
+end
+
+function WorldObjectSpawnerService.Init(_services)
+	task.spawn(function()
+		local gameplay = getGameplayFolder()
+		if not gameplay then
+			warn("[WorldObjectSpawnerService] Workspace.Map not found -- no world objects spawned.")
+			return
+		end
+		spawnClues(gameplay)
+		spawnPuzzles(gameplay)
+		spawnNPCs(gameplay)
+		spawnCheckpoints(gameplay)
+		spawnAccusationBoard(gameplay)
+	end)
+end
+
+return WorldObjectSpawnerService
+]====]
+    },
+    {
         path = "game.StarterPlayer.StarterPlayerScripts.GameClient.Bootstrap",
         className = "LocalScript",
         content = [====[-- StarterPlayerScripts/GameClient/Bootstrap.client.lua
@@ -1350,9 +1836,10 @@ print("[GameClient] Bootstrap complete.")
         path = "game.StarterPlayer.StarterPlayerScripts.GameClient.Controllers.AccusationController",
         className = "ModuleScript",
         content = [====[-- StarterPlayerScripts/GameClient/Controllers/AccusationController.lua
--- Suspect picker + confirm step. The Confirm button stays disabled until a suspect is
--- selected, so there's no accidental one-click accusation (per MAIN_GAME_SYSTEM_RULES.md
--- §9 UI inventory notes).
+-- Suspect picker + confirm step. Shows each suspect's profile blurb (from
+-- InvestigationData via the Accusation/Open payload) so the board reads like an actual
+-- case file, not just a list of names. The Confirm button stays disabled until a suspect
+-- is selected, so there's no accidental one-click accusation.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -1375,7 +1862,7 @@ function AccusationController.Start()
 		Parent = gui,
 		AnchorPoint = Vector2.new(0.5, 0.5),
 		Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromScale(0.4, 0.55),
+		Size = UDim2.fromScale(0.46, 0.6),
 	})
 
 	UIKit.NewLabel({
@@ -1387,15 +1874,19 @@ function AccusationController.Start()
 		Size = UDim2.new(1, -20, 0, 30),
 	})
 
-	local list = Instance.new("Frame")
+	local list = Instance.new("ScrollingFrame")
 	list.Name = "ChoiceList"
 	list.BackgroundTransparency = 1
+	list.BorderSizePixel = 0
 	list.Position = UDim2.new(0, 10, 0, 50)
 	list.Size = UDim2.new(1, -20, 1, -110)
+	list.CanvasSize = UDim2.new(0, 0, 0, 0)
+	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.ScrollBarThickness = 6
 	list.Parent = root
 
 	local layout = Instance.new("UIListLayout")
-	layout.Padding = UDim.new(0, 6)
+	layout.Padding = UDim.new(0, 8)
 	layout.Parent = list
 
 	local feedback = UIKit.NewLabel({
@@ -1419,6 +1910,7 @@ function AccusationController.Start()
 	confirmButton.AutoButtonColor = false
 
 	local selectedId = nil
+	local selectedCard = nil
 
 	local function refreshConfirmState()
 		confirmButton.Active = selectedId ~= nil
@@ -1436,6 +1928,7 @@ function AccusationController.Start()
 	RemoteRegistry.Get("Accusation/Open").OnClientEvent:Connect(function(data)
 		gui.Enabled = true
 		selectedId = nil
+		selectedCard = nil
 		feedback.Text = ""
 		refreshConfirmState()
 
@@ -1446,20 +1939,45 @@ function AccusationController.Start()
 		end
 
 		for _, suspect in ipairs(data.suspects) do
-			local button = UIKit.NewButton({
-				Name = "Suspect_" .. suspect.id,
+			local card = UIKit.NewFrame({
+				Name = "Card_" .. suspect.id,
 				Parent = list,
-				Text = suspect.name,
-				Size = UDim2.new(1, 0, 0, 34),
+				Size = UDim2.new(1, 0, 0, 62),
+				BackgroundColor3 = UIKit.Palette.PanelBlueLight,
 			})
-			button.MouseButton1Click:Connect(function()
+
+			UIKit.NewLabel({
+				Name = "Name",
+				Parent = card,
+				Position = UDim2.new(0, 10, 0, 4),
+				Size = UDim2.new(1, -20, 0, 22),
+				Text = suspect.name,
+				Font = UIKit.Font.Heading,
+			})
+			UIKit.NewLabel({
+				Name = "Profile",
+				Parent = card,
+				Position = UDim2.new(0, 10, 0, 26),
+				Size = UDim2.new(1, -20, 0, 32),
+				Text = suspect.profile or "",
+				TextColor3 = UIKit.Palette.TextMuted,
+				TextWrapped = true,
+				MaxTextSize = 14,
+			})
+
+			local clickCatcher = Instance.new("TextButton")
+			clickCatcher.BackgroundTransparency = 1
+			clickCatcher.Text = ""
+			clickCatcher.Size = UDim2.fromScale(1, 1)
+			clickCatcher.Parent = card
+
+			clickCatcher.MouseButton1Click:Connect(function()
 				selectedId = suspect.id
-				for _, sibling in ipairs(list:GetChildren()) do
-					if sibling:IsA("TextButton") then
-						sibling.BackgroundColor3 = UIKit.Palette.PanelBlue
-					end
+				if selectedCard then
+					selectedCard.BackgroundColor3 = UIKit.Palette.PanelBlueLight
 				end
-				button.BackgroundColor3 = UIKit.Palette.LanternOrange
+				card.BackgroundColor3 = UIKit.Palette.LanternOrange
+				selectedCard = card
 				refreshConfirmState()
 			end)
 		end
@@ -1865,12 +2383,18 @@ return HorrorController
         path = "game.StarterPlayer.StarterPlayerScripts.GameClient.Controllers.HUDController",
         className = "ModuleScript",
         content = [====[-- StarterPlayerScripts/GameClient/Controllers/HUDController.lua
--- Always-visible HUD: objective tracker (carried + deposited jimpitan), trust indicator,
--- night countdown clock, and a simple XZ-projection minimap blip. The minimap background
--- is a plain panel for now -- swap in a real top-down map ImageLabel once the
--- environment team exports one (see README_IMPLEMENTATION.md). Coordinate math assumes
--- Workspace.Map is centered on world origin (0,0,0), per MAP_LEVEL_DESIGN_GUIDE.md's
--- 2048x2048 baseplate -- adjust the offset here if WorldData places it elsewhere.
+-- Always-visible HUD: Free-Fire-style circular minimap (top-left, local windowed view,
+-- rotating player arrow, jimpitan/checkpoint/NPC/puzzle blips), objective step tracker
+-- just under it, night countdown clock top-center, trust indicator top-right.
+--
+-- Clue locations are deliberately NOT shown on the minimap -- revealing them would
+-- trivialize the investigation loop (DESIGN_BRIEF.md's horror rules want "was the clue
+-- real?" to stay uncertain, which requires the player to actually go looking).
+--
+-- Static markers (checkpoints/NPCs/puzzles) come straight from the shared WorldData
+-- module -- that's just world geometry, not a game secret, so no Remote is needed for
+-- them. Jimpitan spawns change at runtime (collected/respawned) so those come from the
+-- `Jimpitan/Spawns` Remote, broadcast by JimpitanSpawnerService.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -1878,6 +2402,7 @@ local RunService = game:GetService("RunService")
 
 local Modules = ReplicatedStorage:WaitForChild("Modules")
 local GameConfig = require(Modules.GameConfig)
+local WorldData = require(Modules.Data.WorldData)
 local RemoteRegistry = require(Modules.Net.RemoteRegistry)
 
 local UIKit = require(script.Parent.Parent.UI.UIKit)
@@ -1886,10 +2411,17 @@ local HUDController = {}
 local player = Players.LocalPlayer
 
 local TRUST_DISPLAY = {
-	trusted = { text = "\240\159\143\174 Dipercaya", color = Color3.fromRGB(120, 200, 140) },
-	neutral = { text = "\240\159\143\174 Netral", color = nil },
-	suspicious = { text = "\240\159\143\174 Dicurigai", color = Color3.fromRGB(210, 150, 60) },
-	feared = { text = "\240\159\143\174 Ditakuti", color = nil },
+	trusted = { text = "Dipercaya", color = Color3.fromRGB(120, 200, 140) },
+	neutral = { text = "Netral", color = nil },
+	suspicious = { text = "Dicurigai", color = Color3.fromRGB(210, 150, 60) },
+	feared = { text = "Ditakuti", color = nil },
+}
+
+local MARKER_STYLE = {
+	jimpitan = { icon = "\240\159\170\153", color = Color3.fromRGB(232, 190, 90), size = 14 },
+	checkpoint = { icon = "\240\159\143\174", color = Color3.fromRGB(120, 170, 220), size = 12 },
+	npc = { icon = "\226\151\143", color = Color3.fromRGB(140, 210, 150), size = 10 },
+	puzzle = { icon = "\226\151\134", color = Color3.fromRGB(190, 140, 230), size = 10 },
 }
 
 local function formatClock(seconds)
@@ -1905,31 +2437,175 @@ function HUDController.Start()
 	local gui = UIKit.NewScreenGui("HUDGui")
 	gui.Parent = player:WaitForChild("PlayerGui")
 
-	-- Objective tracker (top-left)
+	----------------------------------------------------------------------------------
+	-- Minimap (top-left, circular, FF-style)
+	----------------------------------------------------------------------------------
+	local minimapSize = UDim2.fromScale(0.18, 0.32)
+	local minimapOuter = UIKit.NewCircle({
+		Name = "Minimap",
+		Parent = gui,
+		Position = UDim2.fromScale(0.02, 0.03),
+		Size = minimapSize,
+		BackgroundColor3 = UIKit.Palette.PanelBlue,
+		BackgroundTransparency = 0.05,
+		ChromeOptions = { StrokeThickness = 2, StrokeTransparency = 0.1, Gradient = false },
+	})
+	minimapOuter.ClipsDescendants = true
+
+	local compassLabel = UIKit.NewLabel({
+		Name = "Compass",
+		Parent = minimapOuter,
+		Position = UDim2.fromScale(0.5, 0.04),
+		AnchorPoint = Vector2.new(0.5, 0),
+		Size = UDim2.fromOffset(18, 18),
+		Text = "U",
+		Font = UIKit.Font.Heading,
+		TextColor3 = UIKit.Palette.TextMuted,
+		ZIndex = 5,
+	})
+
+	local playerArrow = UIKit.NewLabel({
+		Name = "PlayerArrow",
+		Parent = minimapOuter,
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(20, 20),
+		Text = "\226\150\178",
+		TextColor3 = UIKit.Palette.LanternOrange,
+		Font = UIKit.Font.Heading,
+		Shadow = true,
+		ZIndex = 6,
+	})
+
+	-- Static markers (checkpoints, NPCs, puzzles) built once from WorldData.
+	local staticMarkers = {}
+	local function addStaticMarker(kind, worldPosition)
+		local style = MARKER_STYLE[kind]
+		local dot = UIKit.NewLabel({
+			Name = kind .. "Marker",
+			Parent = minimapOuter,
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Size = UDim2.fromOffset(style.size, style.size),
+			Text = style.icon,
+			TextColor3 = style.color,
+			Visible = false,
+			ZIndex = 3,
+		})
+		table.insert(staticMarkers, { kind = kind, position = worldPosition, gui = dot })
+	end
+
+	for _, checkpointPosition in pairs(WorldData.Village.Checkpoints) do
+		addStaticMarker("checkpoint", checkpointPosition)
+	end
+	for _, npc in ipairs(WorldData.Village.NPCs) do
+		addStaticMarker("npc", npc.position)
+	end
+	for _, puzzle in ipairs(WorldData.Village.Puzzles) do
+		addStaticMarker("puzzle", puzzle.position)
+	end
+
+	-- Dynamic jimpitan markers, rebuilt whenever Jimpitan/Spawns fires.
+	local jimpitanMarkers = {}
+	local function rebuildJimpitanMarkers(spawns)
+		for _, marker in ipairs(jimpitanMarkers) do
+			marker.gui:Destroy()
+		end
+		jimpitanMarkers = {}
+		local style = MARKER_STYLE.jimpitan
+		for _, spawn in ipairs(spawns) do
+			local dot = UIKit.NewLabel({
+				Name = "JimpitanMarker",
+				Parent = minimapOuter,
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Size = UDim2.fromOffset(style.size, style.size),
+				Text = style.icon,
+				TextColor3 = style.color,
+				Visible = false,
+				ZIndex = 4,
+			})
+			table.insert(jimpitanMarkers, { position = Vector3.new(spawn.x, spawn.y, spawn.z), gui = dot })
+		end
+	end
+
+	RemoteRegistry.Get("Jimpitan/Spawns").OnClientEvent:Connect(function(data)
+		rebuildJimpitanMarkers(data.spawns or {})
+	end)
+
+	-- North-up minimap: only the player arrow rotates to show facing. dx maps to
+	-- east/west (left/right), dz maps to north/south (up/down) with -Z treated as
+	-- "north" (up on screen) -- flip this mapping here if the built map's compass
+	-- convention ends up being different once the environment team finalizes it.
+	local radius = GameConfig.Minimap.WorldRadiusStuds
+	local function updateMarker(entry)
+		local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+		if not root then
+			entry.gui.Visible = false
+			return
+		end
+		local dx = entry.position.X - root.Position.X
+		local dz = entry.position.Z - root.Position.Z
+		local dist = math.sqrt(dx * dx + dz * dz)
+		if dist > radius then
+			entry.gui.Visible = false
+			return
+		end
+		entry.gui.Visible = true
+		entry.gui.Position = UDim2.fromScale(0.5 + (dx / radius) * 0.5, 0.5 + (dz / radius) * 0.5)
+	end
+
+	RunService.Heartbeat:Connect(function()
+		local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+		if root then
+			local look = root.CFrame.LookVector
+			local yawDegrees = math.deg(math.atan2(look.X, -look.Z))
+			playerArrow.Rotation = yawDegrees
+		end
+		for _, entry in ipairs(staticMarkers) do
+			updateMarker(entry)
+		end
+		for _, entry in ipairs(jimpitanMarkers) do
+			updateMarker(entry)
+		end
+	end)
+
+	----------------------------------------------------------------------------------
+	-- Objective tracker (just under the minimap)
+	----------------------------------------------------------------------------------
 	local objectiveFrame = UIKit.NewFrame({
 		Name = "Objective",
 		Parent = gui,
-		Position = UDim2.fromScale(0.02, 0.03),
-		Size = UDim2.fromScale(0.3, 0.09),
+		Position = UDim2.fromScale(0.02, 0.365),
+		Size = UDim2.fromScale(0.24, 0.09),
 	})
-	local objectiveLabel = UIKit.NewLabel({
-		Name = "Label",
+	local objectiveTitle = UIKit.NewLabel({
+		Name = "Title",
 		Parent = objectiveFrame,
-		Position = UDim2.new(0, 8, 0, 2),
-		Size = UDim2.new(1, -16, 0.55, 0),
-		Text = "Kumpulkan jimpitan (0/0)",
+		Position = UDim2.new(0, 8, 0, 4),
+		Size = UDim2.new(1, -16, 0.5, 0),
+		Font = UIKit.Font.Heading,
+		Text = "Memuat tugas...",
+	})
+	local objectiveProgress = UIKit.NewLabel({
+		Name = "Progress",
+		Parent = objectiveFrame,
+		Position = UDim2.new(0, 8, 0.5, 0),
+		Size = UDim2.new(1, -16, 0.3, 0),
+		TextColor3 = UIKit.Palette.TextMuted,
+		MaxTextSize = 16,
 	})
 	local carriedLabel = UIKit.NewLabel({
 		Name = "Carried",
 		Parent = objectiveFrame,
-		Position = UDim2.new(0, 8, 0.55, 0),
-		Size = UDim2.new(1, -16, 0.4, 0),
+		Position = UDim2.new(0, 8, 0.8, 0),
+		Size = UDim2.new(1, -16, 0.2, 0),
 		Text = "",
-		TextColor3 = UIKit.Palette.TextMuted,
-		MaxTextSize = 16,
+		TextColor3 = UIKit.Palette.LanternOrange,
+		MaxTextSize = 14,
 	})
 
-	-- Night clock (top-center) -- counts down "waktu ronda" (game_mechanics.md rule #1)
+	----------------------------------------------------------------------------------
+	-- Night clock (top-center)
+	----------------------------------------------------------------------------------
 	local clockFrame = UIKit.NewFrame({
 		Name = "NightClock",
 		Parent = gui,
@@ -1945,7 +2621,9 @@ function HUDController.Start()
 		TextXAlignment = Enum.TextXAlignment.Center,
 	})
 
+	----------------------------------------------------------------------------------
 	-- Trust indicator (top-right)
+	----------------------------------------------------------------------------------
 	local trustFrame = UIKit.NewFrame({
 		Name = "Trust",
 		Parent = gui,
@@ -1961,44 +2639,18 @@ function HUDController.Start()
 		Font = UIKit.Font.Heading,
 	})
 
-	-- Minimap (bottom-right)
-	local minimapFrame = UIKit.NewFrame({
-		Name = "Minimap",
-		Parent = gui,
-		AnchorPoint = Vector2.new(1, 1),
-		Position = UDim2.fromScale(0.98, 0.97),
-		Size = UDim2.fromScale(0.16, 0.28),
-		BackgroundTransparency = 0.3,
-	})
-
-	local blip = Instance.new("Frame")
-	blip.Name = "PlayerBlip"
-	blip.AnchorPoint = Vector2.new(0.5, 0.5)
-	blip.Size = UDim2.fromOffset(8, 8)
-	blip.BackgroundColor3 = UIKit.Palette.LanternOrange
-	blip.BorderSizePixel = 0
-	blip.Parent = minimapFrame
-	local blipCorner = Instance.new("UICorner")
-	blipCorner.CornerRadius = UDim.new(1, 0)
-	blipCorner.Parent = blip
-
-	RunService.Heartbeat:Connect(function()
-		local character = player.Character
-		local root = character and character:FindFirstChild("HumanoidRootPart")
-		if not root then
-			return
-		end
-		local half = GameConfig.World.MAP_HALF_SIZE
-		local nx = math.clamp((root.Position.X + half) / (half * 2), 0, 1)
-		local nz = math.clamp((root.Position.Z + half) / (half * 2), 0, 1)
-		blip.Position = UDim2.fromScale(nx, nz)
-	end)
-
+	----------------------------------------------------------------------------------
+	-- Remote wiring
+	----------------------------------------------------------------------------------
 	RemoteRegistry.Get("Objective/StateChanged").OnClientEvent:Connect(function(data)
-		objectiveLabel.Text = string.format("%s (%d/%d)", data.label, data.progress, data.target)
-		carriedLabel.Text = (data.carried or 0) > 0
-			and string.format("Dibawa: %d (belum disetor)", data.carried)
-			or ""
+		if data.chainComplete then
+			objectiveTitle.Text = data.title
+			objectiveProgress.Text = data.description
+		else
+			objectiveTitle.Text = string.format("%s (Tahap %d/%d)", data.title, data.stepIndex, data.stepCount)
+			objectiveProgress.Text = string.format("%s -- %d/%d", data.description, data.progress, data.target)
+		end
+		carriedLabel.Text = (data.carried or 0) > 0 and string.format("Dibawa: %d (belum disetor)", data.carried) or ""
 	end)
 
 	RemoteRegistry.Get("Trust/StateChanged").OnClientEvent:Connect(function(data)
@@ -2107,12 +2759,14 @@ return JournalController
         path = "game.StarterPlayer.StarterPlayerScripts.GameClient.Controllers.PuzzleController",
         className = "ModuleScript",
         content = [====[-- StarterPlayerScripts/GameClient/Controllers/PuzzleController.lua
--- Generic overlay for PuzzleService's multiple-choice "observation" puzzle type.
--- Adding a new PuzzleId on the server needs zero changes here -- this Controller only
--- ever renders whatever `question`/`options` Puzzle/Data sends.
+-- Sequence-recall puzzle UI ("repeat the pattern"), matching PuzzleService/
+-- InvestigationData.Puzzles. Shows `symbolCount` numbered pads, auto-plays the demo
+-- sequence once (each pad flashes in order), then lets the player tap them back in the
+-- same order. Adding a new PuzzleId with more/fewer symbols needs zero changes here.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
 
 local Modules = ReplicatedStorage:WaitForChild("Modules")
 local RemoteRegistry = require(Modules.Net.RemoteRegistry)
@@ -2120,6 +2774,14 @@ local UIKit = require(script.Parent.Parent.UI.UIKit)
 
 local PuzzleController = {}
 local player = Players.LocalPlayer
+
+local PAD_COLORS = {
+	Color3.fromRGB(214, 100, 100),
+	Color3.fromRGB(100, 180, 214),
+	Color3.fromRGB(214, 190, 100),
+	Color3.fromRGB(140, 200, 140),
+	Color3.fromRGB(190, 140, 220),
+}
 
 function PuzzleController.Start()
 	local gui = UIKit.NewScreenGui("PuzzleGui")
@@ -2131,28 +2793,49 @@ function PuzzleController.Start()
 		Parent = gui,
 		AnchorPoint = Vector2.new(0.5, 0.5),
 		Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromScale(0.45, 0.45),
+		Size = UDim2.fromScale(0.42, 0.48),
 	})
 
-	local question = UIKit.NewLabel({
+	local title = UIKit.NewLabel({
 		Name = "Title",
 		Parent = root,
 		Font = UIKit.Font.Heading,
 		Position = UDim2.new(0, 10, 0, 10),
-		Size = UDim2.new(1, -20, 0, 60),
-		TextWrapped = true,
+		Size = UDim2.new(1, -20, 0, 30),
 	})
 
-	local optionsHolder = Instance.new("Frame")
-	optionsHolder.Name = "ChoiceList"
-	optionsHolder.BackgroundTransparency = 1
-	optionsHolder.Position = UDim2.new(0, 10, 0, 80)
-	optionsHolder.Size = UDim2.new(1, -20, 1, -140)
-	optionsHolder.Parent = root
+	local description = UIKit.NewLabel({
+		Name = "Description",
+		Parent = root,
+		Position = UDim2.new(0, 10, 0, 42),
+		Size = UDim2.new(1, -20, 0, 44),
+		TextColor3 = UIKit.Palette.TextMuted,
+		TextWrapped = true,
+		MaxTextSize = 16,
+	})
 
-	local layout = Instance.new("UIListLayout")
-	layout.Padding = UDim.new(0, 6)
-	layout.Parent = optionsHolder
+	local statusLabel = UIKit.NewLabel({
+		Name = "Status",
+		Parent = root,
+		Position = UDim2.new(0, 10, 0, 90),
+		Size = UDim2.new(1, -20, 0, 24),
+		TextColor3 = UIKit.Palette.LanternOrange,
+		TextXAlignment = Enum.TextXAlignment.Center,
+	})
+
+	local padsHolder = Instance.new("Frame")
+	padsHolder.Name = "ChoiceList"
+	padsHolder.BackgroundTransparency = 1
+	padsHolder.Position = UDim2.new(0, 10, 0, 120)
+	padsHolder.Size = UDim2.new(1, -20, 1, -190)
+	padsHolder.Parent = root
+
+	local padsLayout = Instance.new("UIListLayout")
+	padsLayout.FillDirection = Enum.FillDirection.Horizontal
+	padsLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	padsLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+	padsLayout.Padding = UDim.new(0, 10)
+	padsLayout.Parent = padsHolder
 
 	local feedback = UIKit.NewLabel({
 		Name = "Feedback",
@@ -2160,6 +2843,7 @@ function PuzzleController.Start()
 		Position = UDim2.new(0, 10, 1, -50),
 		Size = UDim2.new(1, -20, 0, 40),
 		TextColor3 = UIKit.Palette.LanternOrange,
+		TextXAlignment = Enum.TextXAlignment.Center,
 	})
 
 	local hintBadge = UIKit.NewLabel({
@@ -2168,38 +2852,83 @@ function PuzzleController.Start()
 		AnchorPoint = Vector2.new(1, 0),
 		Position = UDim2.new(1, -10, 0, 10),
 		Size = UDim2.fromOffset(28, 28),
-		Text = "💡",
+		Text = "\240\159\146\161",
 		Visible = false,
 	})
 
 	local currentPuzzleId = nil
+	local playerInput = {}
+	local acceptingInput = false
+
+	local function flashPad(pad)
+		local original = pad.BackgroundColor3
+		TweenService:Create(pad, TweenInfo.new(0.15), { BackgroundColor3 = Color3.new(1, 1, 1) }):Play()
+		task.delay(0.25, function()
+			TweenService:Create(pad, TweenInfo.new(0.15), { BackgroundColor3 = original }):Play()
+		end)
+	end
+
+	local function submitIfComplete(sequenceLength)
+		if #playerInput < sequenceLength then
+			return
+		end
+		acceptingInput = false
+		RemoteRegistry.Get("Puzzle/Submit"):FireServer({ puzzleId = currentPuzzleId, answer = playerInput })
+	end
 
 	RemoteRegistry.Get("Puzzle/Data").OnClientEvent:Connect(function(data)
 		gui.Enabled = true
 		currentPuzzleId = data.puzzleId
-		question.Text = data.question
+		playerInput = {}
+		acceptingInput = false
+		title.Text = data.displayName or "Teka-teki"
+		description.Text = data.description or ""
 		feedback.Text = ""
+		statusLabel.Text = "Perhatikan urutannya..."
 
-		for _, child in ipairs(optionsHolder:GetChildren()) do
+		for _, child in ipairs(padsHolder:GetChildren()) do
 			if child:IsA("GuiObject") then
 				child:Destroy()
 			end
 		end
 
-		for _, option in ipairs(data.options) do
-			local button = UIKit.NewButton({
-				Name = "Option_" .. option.id,
-				Parent = optionsHolder,
-				Text = option.text,
-				Size = UDim2.new(1, 0, 0, 34),
+		local pads = {}
+		for i = 1, data.symbolCount do
+			local pad = UIKit.NewButton({
+				Name = "Pad_" .. i,
+				Parent = padsHolder,
+				Text = tostring(i),
+				Size = UDim2.fromScale(0.22, 0.9),
+				BackgroundColor3 = PAD_COLORS[((i - 1) % #PAD_COLORS) + 1],
 			})
-			button.MouseButton1Click:Connect(function()
-				RemoteRegistry.Get("Puzzle/Submit"):FireServer({
-					puzzleId = currentPuzzleId,
-					answer = option.id,
-				})
+			pads[i] = pad
+			pad.Active = false
+			pad.MouseButton1Click:Connect(function()
+				if not acceptingInput then
+					return
+				end
+				table.insert(playerInput, i)
+				flashPad(pad)
+				submitIfComplete(#data.sequence)
 			end)
 		end
+
+		-- Play the demo sequence, then open input.
+		task.spawn(function()
+			task.wait(0.4)
+			for _, symbol in ipairs(data.sequence) do
+				local pad = pads[symbol]
+				if pad then
+					flashPad(pad)
+				end
+				task.wait(0.55)
+			end
+			statusLabel.Text = "Giliranmu -- ulangi urutannya"
+			acceptingInput = true
+			for _, pad in ipairs(pads) do
+				pad.Active = true
+			end
+		end)
 	end)
 
 	RemoteRegistry.Get("Puzzle/Result").OnClientEvent:Connect(function(data)
@@ -2207,10 +2936,10 @@ function PuzzleController.Start()
 			feedback.Text = "Benar! Petunjuk baru ditambahkan ke jurnal."
 			feedback.TextColor3 = Color3.fromRGB(120, 200, 140)
 		else
-			feedback.Text = "Sepertinya bukan itu. Coba amati lagi lain kali."
+			feedback.Text = "Urutannya belum tepat. Coba amati lagi lain kali."
 			feedback.TextColor3 = UIKit.Palette.FearedRed
 		end
-		task.delay(1.5, function()
+		task.delay(1.6, function()
 			gui.Enabled = false
 		end)
 	end)
@@ -2228,8 +2957,9 @@ return PuzzleController
         className = "ModuleScript",
         content = [====[-- StarterPlayerScripts/GameClient/UI/UIKit.lua
 -- Shared instance-builder + style helpers, implementing ROBLOX_UI_SKILL.md §1-4.
--- Every Controller should build its ScreenGui through these helpers rather than
--- hand-rolling Instance.new calls, so palette/typography/motion stay consistent.
+-- Every Controller builds its ScreenGui through these helpers rather than hand-rolling
+-- Instance.new calls, so palette/typography/motion/borders stay consistent everywhere --
+-- improving NewFrame/NewButton here improves every screen in the game at once.
 
 local TweenService = game:GetService("TweenService")
 local SoundService = game:GetService("SoundService")
@@ -2241,13 +2971,13 @@ UIKit.Palette = {
 	LanternOrange = Color3.fromRGB(232, 168, 85),
 	MoonlightBlue = Color3.fromRGB(28, 34, 46),
 	PanelBlue = Color3.fromRGB(20, 24, 33),
+	PanelBlueLight = Color3.fromRGB(32, 38, 50),
 	FearedRed = Color3.fromRGB(150, 40, 40),
 	TextLight = Color3.fromRGB(235, 230, 220),
 	TextMuted = Color3.fromRGB(160, 160, 165),
+	BorderGold = Color3.fromRGB(140, 110, 60),
 }
 
--- TODO(art): swap Narrative for a licensed rustic/hand-written font asset once one is
--- picked; Enum.Font.Cartoon is a placeholder that is at least NOT a generic UI sans.
 UIKit.Font = {
 	Narrative = Enum.Font.Cartoon,
 	Body = Enum.Font.Gotham,
@@ -2262,23 +2992,63 @@ function UIKit.NewScreenGui(name)
 	return gui
 end
 
+-- Adds a subtle border + soft top-to-bottom gradient to any GuiObject -- this is what
+-- turns a flat rectangle into something that reads as a "panel" instead of a placeholder.
+function UIKit.ApplyPanelChrome(guiObject, options)
+	options = options or {}
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = options.StrokeColor or UIKit.Palette.BorderGold
+	stroke.Thickness = options.StrokeThickness or 1
+	stroke.Transparency = options.StrokeTransparency or 0.35
+	stroke.Parent = guiObject
+
+	if options.Gradient ~= false then
+		local gradient = Instance.new("UIGradient")
+		gradient.Color = ColorSequence.new({
+			ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+			ColorSequenceKeypoint.new(1, Color3.fromRGB(180, 180, 180)),
+		})
+		gradient.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.85),
+			NumberSequenceKeypoint.new(1, 1),
+		})
+		gradient.Rotation = 90
+		gradient.Parent = guiObject
+	end
+
+	return stroke
+end
+
 function UIKit.NewFrame(props)
 	local frame = Instance.new("Frame")
 	frame.Name = props.Name or "Frame"
 	frame.BackgroundColor3 = props.BackgroundColor3 or UIKit.Palette.PanelBlue
-	frame.BackgroundTransparency = props.BackgroundTransparency or 0.15
+	frame.BackgroundTransparency = props.BackgroundTransparency or 0.1
 	frame.BorderSizePixel = 0
 	frame.AnchorPoint = props.AnchorPoint or Vector2.new(0, 0)
 	frame.Position = props.Position or UDim2.fromScale(0, 0)
 	frame.Size = props.Size or UDim2.fromScale(0.2, 0.1)
 	frame.Visible = props.Visible ~= false
+	frame.ClipsDescendants = props.ClipsDescendants or false
 	frame.Parent = props.Parent
 
 	local corner = Instance.new("UICorner")
-	corner.CornerRadius = props.CornerRadius or UDim.new(0, 8)
+	corner.CornerRadius = props.CornerRadius or UDim.new(0, 10)
 	corner.Parent = frame
 
+	if props.Chrome ~= false then
+		UIKit.ApplyPanelChrome(frame, props.ChromeOptions)
+	end
+
 	return frame
+end
+
+-- A perfectly circular panel (minimap frame, round icon badges, etc).
+function UIKit.NewCircle(props)
+	props = props or {}
+	props.CornerRadius = UDim.new(1, 0)
+	return UIKit.NewFrame(props)
 end
 
 function UIKit.NewLabel(props)
@@ -2296,6 +3066,8 @@ function UIKit.NewLabel(props)
 	label.Position = props.Position or UDim2.fromScale(0, 0)
 	label.Size = props.Size or UDim2.fromScale(1, 1)
 	label.Visible = props.Visible ~= false
+	label.Rotation = props.Rotation or 0
+	label.ZIndex = props.ZIndex or 1
 	label.Parent = props.Parent
 
 	local constraint = Instance.new("UITextSizeConstraint")
@@ -2303,13 +3075,18 @@ function UIKit.NewLabel(props)
 	constraint.MinTextSize = props.MinTextSize or 10
 	constraint.Parent = label
 
+	if props.Shadow then
+		label.TextStrokeTransparency = 0.6
+		label.TextStrokeColor3 = Color3.new(0, 0, 0)
+	end
+
 	return label
 end
 
 function UIKit.NewButton(props)
 	local button = Instance.new("TextButton")
 	button.Name = props.Name or "Button"
-	button.BackgroundColor3 = props.BackgroundColor3 or UIKit.Palette.PanelBlue
+	button.BackgroundColor3 = props.BackgroundColor3 or UIKit.Palette.PanelBlueLight
 	button.AutoButtonColor = true
 	button.BorderSizePixel = 0
 	button.Font = props.Font or UIKit.Font.Body
@@ -2325,6 +3102,10 @@ function UIKit.NewButton(props)
 	corner.CornerRadius = UDim.new(0, 6)
 	corner.Parent = button
 
+	if props.Chrome ~= false then
+		UIKit.ApplyPanelChrome(button, { Gradient = false, StrokeTransparency = 0.5 })
+	end
+
 	local constraint = Instance.new("UITextSizeConstraint")
 	constraint.MaxTextSize = 22
 	constraint.MinTextSize = 10
@@ -2334,14 +3115,12 @@ function UIKit.NewButton(props)
 end
 
 -- §4 Motion & feedback ----------------------------------------------------------------
--- Standard show/hide tween: Quad/Out, 0.2-0.35s, per ROBLOX_UI_SKILL.md.
-
 function UIKit.FadeIn(guiObject, targetTransparency, duration)
 	guiObject.Visible = true
 	local tween = TweenService:Create(
 		guiObject,
 		TweenInfo.new(duration or 0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-		{ BackgroundTransparency = targetTransparency or 0.15 }
+		{ BackgroundTransparency = targetTransparency or 0.1 }
 	)
 	tween:Play()
 	return tween
@@ -2361,8 +3140,6 @@ function UIKit.FadeOutAndHide(guiObject, duration)
 end
 
 -- Kentongan / whisper / clue-found sound cues -----------------------------------------
--- No-ops on the rbxassetid://0 placeholders in GameConfig.Audio, so every Controller
--- can call this unconditionally -- it starts working the instant real asset ids land.
 function UIKit.PlaySound(soundId, volume)
 	if not soundId or soundId == "rbxassetid://0" then
 		return
@@ -2392,6 +3169,15 @@ local GameConfig = {}
 GameConfig.World = {
 	MAP_SIZE = 2048,
 	MAP_HALF_SIZE = 1024,
+	BASEPLATE_HEIGHT = 16,
+}
+
+GameConfig.Queue = {
+	PAD_POSITIONS = {
+		Easy = Vector3.new(-170, 2, -60),
+		Medium = Vector3.new(0, 2, -170),
+		Hard = Vector3.new(170, 2, -60),
+	}
 }
 
 GameConfig.Difficulty = {
@@ -2458,11 +3244,48 @@ GameConfig.Trust = {
 		FalseAccusationPublic = -10,
 		IgnoredWarga = -2,
 	},
+	-- Named trust actions used by DialogueData.lua's `trustAction` field on choices, so
+	-- narrative content can say "HELPED_WARGA" instead of a raw number. Add more here as
+	-- new trustAction names show up in DialogueData.
+	Actions = {
+		COMPLETED_TASK = 3,
+		HELPED_WARGA = 4,
+		CORRECT_DIALOGUE = 4,
+		WRONG_DIALOGUE = -5,
+		TRIGGERED_PANIC = -8,
+	},
 }
 
 GameConfig.Investigation = {
 	MinCluesForAccusation = 3,
 	HintUnlockAfterFailures = 3, -- game_mechanics.md rule #9
+}
+
+-- Objective chain step types, used by ObjectiveData.lua's chain definitions and reported
+-- by Services via ObjectiveService.ReportProgress(player, typeOrStepId, amount).
+GameConfig.Objectives = {
+	Types = {
+		BRIEFING = "briefing",
+		COLLECT_JIMPITAN = "collect_jimpitan",
+		FIND_CLUE = "find_clue",
+		TALK_NPC = "talk_npc",
+		SOLVE_PUZZLE = "solve_puzzle",
+		INVESTIGATE_AREA = "investigate_area",
+		DETERMINE_SUSPECT = "determine_suspect",
+	},
+}
+
+-- Narrative checkpoint ids, matching WorldData.Village.Checkpoints keys 1:1 -- when an
+-- ObjectiveData step lists one of these as its `checkpoint` field, completing that step
+-- also banks the player's fail-return position at that WorldData location.
+GameConfig.Checkpoints = {
+	INTRO_COMPLETE = "intro_complete",
+	JIMPITAN_COLLECTED = "jimpitan_collected",
+	FIRST_CLUE_FOUND = "first_clue_found",
+	KEY_CLUE_FOUND = "key_clue_found",
+	SUSPECT_IDENTIFIED = "suspect_identified",
+	PRE_CLIMAX = "pre_climax",
+	ENDING_CHOICE = "ending_choice",
 }
 
 GameConfig.Ending = {
@@ -2488,6 +3311,20 @@ GameConfig.SaveService = {
 	AutoSaveIntervalSeconds = 120,
 }
 
+-- Jimpitan pickup spawn behavior (JimpitanSpawnerService). One spawn is generated near
+-- each WorldData.Village.House, offset so it sits by the porch/gate rather than
+-- overlapping the house model itself.
+GameConfig.JimpitanSpawn = {
+	OffsetStuds = Vector3.new(6, 2, 6),
+	RespawnDelaySeconds = 25,
+}
+
+-- Minimap rendering (HUDController). FF-style: fixed local radius around the player,
+-- north-up, player arrow rotates to face direction instead of the map rotating.
+GameConfig.Minimap = {
+	WorldRadiusStuds = 260,
+}
+
 return GameConfig
 ]====]
     },
@@ -2495,88 +3332,19 @@ return GameConfig
         path = "game.ReplicatedStorage.Modules.NarrativeData",
         className = "ModuleScript",
         content = [====[-- ReplicatedStorage/Modules/NarrativeData.lua
--- Data-driven narrative content. Client is allowed to require this module directly
--- (it's shared, not server-only) to resolve Ending/Hint display text locally --
--- Services only ever send ids over Remotes, never hardcoded text.
+-- Endings, hints, and entity flavor names -- the parts of the narrative that aren't
+-- per-NPC dialogue trees or per-suspect/clue investigation content.
 --
--- TODO(narrative): this currently implements ONE full NPC (Pak RT, easy-mode intro
--- branch) as a working example of the Requires/TrustDelta/locked pattern. Extend NPCs /
--- Nodes with the rest of game_naratif.md's Medium/Hard conversations following the same
--- shape -- DialogueService does not need any code changes to support more content.
-
-local GameConfig = require(script.Parent.GameConfig)
+-- NOTE: NPC dialogue trees now live in Data/DialogueData.lua and suspect/clue/puzzle
+-- content lives in Data/InvestigationData.lua (both far more complete than this file's
+-- old placeholder NPCs/Suspects tables, which have been removed -- don't recreate them
+-- here, extend the Data/ files instead).
+--
+-- Client is allowed to require this module directly (it's shared, not server-only) to
+-- resolve Ending/Hint display text locally -- Services only ever send ids over Remotes,
+-- never hardcoded text.
 
 local NarrativeData = {}
-
-NarrativeData.NPCs = {
-	pak_rt = {
-		DisplayName = "Pak RT",
-		StartNode = "intro",
-		Nodes = {
-			intro = {
-				Text = "Malam ini kamu mulai ronda. Jangan lupa ambil jimpitan di setiap rumah. "
-					.. "Kalau ada kejanggalan, segera lapor.",
-				Choices = {
-					{ Id = "siap", Text = "Siap, Pak.", Next = "briefing" },
-				},
-			},
-			briefing = {
-				Text = "Bagaimana ronda kemarin?",
-				Choices = {
-					{ Id = "aman", Text = "Aman, Pak.", Next = "continue_night" },
-					{
-						Id = "report_missing",
-						Text = "Pak, uang di pos ronda hilang.",
-						Next = "missing_money",
-						Requires = { ClueId = "missing_money_clue" },
-						-- Honesty about the missing money is rewarded, per
-						-- game_mechanics.md's Player Actions table ("Dialogue Choice ...
-						-- mempengaruhi tingkat kepercayaan warga"). This is the working
-						-- example of the TrustDelta hook -- add it to any other choice
-						-- the narrative team wants to move trust.
-						TrustDelta = GameConfig.Trust.Delta.HelpfulChoice,
-					},
-				},
-			},
-			continue_night = {
-				Text = "Bagus. Lanjutkan malam ini.",
-				Choices = {},
-			},
-			missing_money = {
-				Text = "Hilang? Coba kamu selidiki dulu sebelum kita simpulkan macam-macam.",
-				Choices = {
-					{
-						Id = "ask_suspect",
-						Text = "Pak, menurut Bapak siapa yang mencurigakan?",
-						Next = "hint_suspect",
-						Requires = { Trust = "neutral" },
-					},
-				},
-			},
-			hint_suspect = {
-				Text = "Saya tidak mau menuduh sembarangan. Cari bukti dulu, baru bicara ke saya lagi.",
-				Choices = {},
-			},
-		},
-	},
-}
-
--- Suspect list shown on the Accusation Board. `eligibleRoles` is what this suspect COULD
--- be cast as if the random case generator picks them -- it is NOT the actual answer.
--- The real per-playthrough solution is decided by CaseGenerationService, not here (see
--- that Service for why: the same static suspect->culprit mapping every game would make
--- every playthrough identical, which the team explicitly did not want).
--- TODO(narrative): replace with the final suspect roster + NPCIds once environment art
--- assigns real names to houses 01-08. Keep at least 2-3 eligible suspects per role so
--- randomization has something to pick from.
-NarrativeData.Suspects = {
-	{ id = "warga_2", name = "Warga Rumah 02", eligibleRoles = {} }, -- permanent decoy, never guilty
-	{ id = "warga_4", name = "Warga Rumah 04", eligibleRoles = { "human" } },
-	{ id = "warga_5", name = "Warga Rumah 05", eligibleRoles = { "human" } },
-	{ id = "orang_luar", name = "Orang Tak Dikenal", eligibleRoles = { "human" } },
-	{ id = "warga_7", name = "Warga Rumah 07 (dekat Sumur)", eligibleRoles = { "pesugihan" } },
-	{ id = "warga_8", name = "Warga Rumah 08 (dekat Sumur)", eligibleRoles = { "pesugihan" } },
-}
 
 NarrativeData.Endings = {
 	EasySolved = {
@@ -2623,6 +3391,591 @@ return NarrativeData
 ]====]
     },
     {
+        path = "game.ReplicatedStorage.Modules.Data.DialogueData",
+        className = "ModuleScript",
+        content = [====[--!strict
+
+local DialogueData = {}
+
+DialogueData.Dialogues = {
+	pak_rt = {
+		start = "start",
+		nodes = {
+			start = {
+				line = "Kamu sudah siap ronda? Ingat, catat dulu sebelum menyimpulkan.",
+				choices = {
+					{
+						id = "accept_briefing",
+						text = "Saya siap, Pak.",
+						nextNode = "briefing",
+						objectiveProgress = "brief_pak_rt",
+						trustAction = "COMPLETED_TASK",
+					},
+					{
+						id = "ask_missing",
+						text = "Sudah berapa kali uang hilang?",
+						nextNode = "missing_context",
+						requiredTrust = "neutral",
+					},
+				},
+			},
+			briefing = {
+				line = "Mulai dari rumah Bu Siti. Kalau ada tabung kosong, jangan ributkan dulu.",
+				choices = {
+					{ id = "close", text = "Saya berangkat.", close = true },
+				},
+			},
+			missing_context = {
+				line = "Tiga malam. Mungkin empat. Buku catatan juga tidak sepenuhnya rapi.",
+				choices = {
+					{ id = "ledger", text = "Saya akan cek buku catatan.", grantClue = "ledger_erased", close = true },
+				},
+			},
+		},
+	},
+	bu_siti = {
+		start = "start",
+		nodes = {
+			start = {
+				line = "Saya sudah isi tabung itu, Nak. Koinnya tidak mungkin hilang sendiri.",
+				choices = {
+					{ id = "calm", text = "Saya cek pelan-pelan, Bu.", trustAction = "HELPED_WARGA", grantClue = "empty_can_siti", close = true },
+					{ id = "pressure", text = "Ibu yakin tidak lupa?", trustAction = "WRONG_DIALOGUE", close = true },
+				},
+			},
+		},
+	},
+	mas_agus = {
+		start = "start",
+		nodes = {
+			start = {
+				line = "Kalau cuma karena saya baru pulang dari kota, semua orang jadi curiga?",
+				choices = {
+					{ id = "apologize", text = "Saya cari fakta, bukan gosip.", trustAction = "CORRECT_DIALOGUE", close = true },
+					{ id = "accuse_soft", text = "Ada yang melihat bayangan di rumahmu.", nextNode = "shadow" },
+				},
+			},
+			shadow = {
+				line = "Bayangan? Lampu depan saya mati dari sore. Cek saja kalau tidak percaya.",
+				choices = {
+					{ id = "inspect_shadow", text = "Saya akan cek arah lampunya.", objectiveProgress = "solve_shadow_medium", close = true },
+				},
+			},
+		},
+	},
+	pak_joko = {
+		start = "start",
+		nodes = {
+			start = {
+				line = "Saya cuma pulang dari warung. Jangan samakan hutang dengan mencuri.",
+				choices = {
+					{ id = "ask_debt", text = "Kenapa catatan hutangmu tanggalnya sama?", requiredClue = "debt_note", nextNode = "debt" },
+					{ id = "observe", text = "Saya hanya mencocokkan keterangan.", close = true },
+				},
+			},
+			debt = {
+				line = "Semua orang punya masalah. Tapi tidak semua orang diberi jalan keluar.",
+				choices = {
+					{ id = "ritual_hint", text = "Jalan keluar seperti apa?", grantClue = "contradicting_alibi", trustAction = "CORRECT_DIALOGUE", close = true },
+				},
+			},
+		},
+	},
+	bu_ani = {
+		start = "start",
+		nodes = {
+			start = {
+				line = "Saya tidak mau menuduh, tapi malam-malam itu Pak Joko sering lewat gang kosong.",
+				choices = {
+					{ id = "ask_time", text = "Jam berapa Ibu melihatnya?", grantClue = "contradicting_alibi", close = true },
+					{ id = "spread", text = "Beri tahu warga lain agar waspada.", trustAction = "TRIGGERED_PANIC", close = true },
+				},
+			},
+		},
+	},
+	mbah_darmo = {
+		start = "start",
+		nodes = {
+			start = {
+				line = "Tidak semua yang kecil itu tidak berharga. Koin bisa jadi tanda.",
+				requiredTrust = "trusted",
+				choices = {
+					{ id = "ask_symbol", text = "Tanda seperti apa, Mbah?", grantClue = "ritual_token", close = true },
+				},
+			},
+			locked = {
+				line = "Kalau warga belum percaya padamu, ucapanku hanya akan jadi fitnah baru.",
+				choices = {
+					{ id = "close", text = "Saya akan kembali nanti.", close = true },
+				},
+			},
+		},
+	},
+}
+
+function DialogueData.GetDialogue(npcId: string)
+	return DialogueData.Dialogues[npcId]
+end
+
+return DialogueData
+]====]
+    },
+    {
+        path = "game.ReplicatedStorage.Modules.Data.InvestigationData",
+        className = "ModuleScript",
+        content = [====[--!strict
+
+local InvestigationData = {}
+
+InvestigationData.Suspects = {
+	mas_agus = {
+		displayName = "Mas Agus",
+		profile = "Mudah dituduh karena baru pulang dari kota, tetapi banyak bukti hanya prasangka.",
+		isHumanCulprit = false,
+		isPesugihanActor = false,
+	},
+	pak_joko = {
+		displayName = "Pak Joko",
+		profile = "Pedagang kecil yang hutangnya menumpuk dan sering terlihat gelisah.",
+		isHumanCulprit = true,
+		isPesugihanActor = true,
+	},
+	mbah_darmo = {
+		displayName = "Mbah Darmo",
+		profile = "Saksi yang memahami tanda ritual. Terlihat menakutkan, tetapi bukan pelaku.",
+		isHumanCulprit = false,
+		isPesugihanActor = false,
+	},
+	bu_ani = {
+		displayName = "Bu Ani",
+		profile = "Penyebar gosip yang kadang menyamarkan fakta penting.",
+		isHumanCulprit = false,
+		isPesugihanActor = false,
+	},
+}
+
+InvestigationData.Clues = {
+	empty_can_siti = {
+		displayName = "Tabung Bu Siti Kosong",
+		location = "Rumah Bu Siti",
+		description = "Tabung jimpitan kosong, tetapi ada bekas koin di dasar bambu.",
+		difficulty = { Easy = true, Medium = true, Hard = true },
+		route = "human",
+		weight = 1,
+	},
+	ledger_erased = {
+		displayName = "Buku Jimpitan Dihapus",
+		location = "Pos Ronda",
+		description = "Catatan setoran kemarin terhapus tidak rapi. Ada nama Pak Joko dekat halaman sobek.",
+		difficulty = { Easy = true, Medium = true, Hard = true },
+		route = "human",
+		weight = 2,
+	},
+	muddy_sandals = {
+		displayName = "Sandal Berlumpur",
+		location = "Gang Rumah Pak Joko",
+		description = "Lumpur sawah menempel di sandal dekat rumah Pak Joko.",
+		difficulty = { Easy = true, Medium = true, Hard = true },
+		route = "human",
+		weight = 2,
+	},
+	false_shadow_agus = {
+		displayName = "Bayangan di Jendela Agus",
+		location = "Rumah Mas Agus",
+		description = "Bayangan bergerak di balik jendela, tetapi arahnya tidak sesuai sumber cahaya.",
+		difficulty = { Medium = true, Hard = true },
+		route = "false",
+		isFalse = true,
+		weight = -1,
+	},
+	coin_circle = {
+		displayName = "Lingkaran Koin",
+		location = "Rumah Kosong",
+		description = "Koin jimpitan tersusun melingkar bersama benang merah dan abu kemenyan.",
+		difficulty = { Medium = true, Hard = true },
+		route = "pesugihan",
+		weight = 3,
+	},
+	wet_footprints = {
+		displayName = "Jejak Kaki Basah",
+		location = "Gang Gelap",
+		description = "Jejak kecil berhenti di dinding. Tidak ada jejak kembali.",
+		difficulty = { Medium = true, Hard = true },
+		route = "pesugihan",
+		weight = 2,
+	},
+	debt_note = {
+		displayName = "Catatan Hutang",
+		location = "Warung Pak Joko",
+		description = "Catatan hutang besar dengan tanggal yang sama dengan hilangnya setoran.",
+		difficulty = { Hard = true },
+		route = "human",
+		weight = 3,
+	},
+	ritual_receipt = {
+		displayName = "Kertas Mantra",
+		location = "Area Ritual",
+		description = "Kertas lusuh menyebut setoran kecil sebagai pembuka jalan kekayaan.",
+		difficulty = { Hard = true },
+		route = "pesugihan",
+		weight = 4,
+	},
+	contradicting_alibi = {
+		displayName = "Alibi Bertentangan",
+		location = "Dialog Warga",
+		description = "Bu Ani dan Pak Joko memberi waktu kejadian yang tidak cocok.",
+		difficulty = { Hard = true },
+		route = "human",
+		weight = 3,
+	},
+	ritual_token = {
+		displayName = "Koin Hangus",
+		location = "Rumpun Bambu",
+		description = "Koin jimpitan terbakar separuh, seolah dipakai sebagai tanda dalam ritual.",
+		difficulty = { Hard = true },
+		route = "pesugihan",
+		weight = 4,
+	},
+}
+
+InvestigationData.Puzzles = {
+	kentongan_pattern = {
+		displayName = "Pola Kentongan",
+		description = "Dengarkan pola three pukulan dari pos ronda untuk membuka laci buku jimpitan.",
+		requiredDifficulty = "Easy",
+		rewardClue = "ledger_erased",
+		sequence = { 2, 1, 3 },
+	},
+	window_shadow = {
+		displayName = "Arah Bayangan",
+		description = "Bandingkan arah lampu teras dengan bayangan di jendela Mas Agus.",
+		requiredDifficulty = "Medium",
+		rewardClue = "false_shadow_agus",
+		sequence = { 1, 3, 2 },
+	},
+	ritual_symbols = {
+		displayName = "Simbol Ritual",
+		description = "Susun simbol koin, abu, dan benang sesuai catatan Mbah Darmo.",
+		requiredDifficulty = "Hard",
+		rewardClue = "ritual_receipt",
+		sequence = { 3, 1, 2, 3 },
+	},
+}
+
+function InvestigationData.GetClue(clueId: string)
+	return InvestigationData.Clues[clueId]
+end
+
+function InvestigationData.IsClueAllowed(clueId: string, difficulty: string): boolean
+	local clue = InvestigationData.GetClue(clueId)
+	return clue ~= nil and clue.difficulty[difficulty] == true
+end
+
+function InvestigationData.GetCluesForDifficulty(difficulty: string): {string}
+	local clueIds = {}
+	for clueId, clue in pairs(InvestigationData.Clues) do
+		if clue.difficulty[difficulty] then
+			table.insert(clueIds, clueId)
+		end
+	end
+	table.sort(clueIds)
+	return clueIds
+end
+
+return InvestigationData
+]====]
+    },
+    {
+        path = "game.ReplicatedStorage.Modules.Data.ObjectiveData",
+        className = "ModuleScript",
+        content = [====[--!strict
+
+local GameConfig = require(script.Parent.Parent.GameConfig)
+
+local ObjectiveData = {}
+
+ObjectiveData.Chains = {
+	Easy = {
+		{
+			id = "brief_pak_rt",
+			type = GameConfig.Objectives.Types.BRIEFING,
+			title = "Temui Pak RT",
+			description = "Dengarkan briefing di pos ronda.",
+			target = 1,
+			checkpoint = GameConfig.Checkpoints.INTRO_COMPLETE,
+		},
+		{
+			id = "collect_jimpitan_easy",
+			type = GameConfig.Objectives.Types.COLLECT_JIMPITAN,
+			title = "Ambil Jimpitan",
+			description = "Kumpulkan jimpitan dari rumah warga.",
+			target = 5,
+			checkpoint = GameConfig.Checkpoints.JIMPITAN_COLLECTED,
+		},
+		{
+			id = "inspect_missing_easy",
+			type = GameConfig.Objectives.Types.FIND_CLUE,
+			title = "Periksa Tabung Kosong",
+			description = "Cari petunjuk pertama dari rumah yang kehilangan uang.",
+			target = 2,
+			checkpoint = GameConfig.Checkpoints.FIRST_CLUE_FOUND,
+		},
+		{
+			id = "talk_witness_easy",
+			type = GameConfig.Objectives.Types.TALK_NPC,
+			title = "Bicara dengan Warga",
+			description = "Kumpulkan keterangan dari warga yang melihat sesuatu.",
+			target = 2,
+		},
+		{
+			id = "accuse_easy",
+			type = GameConfig.Objectives.Types.DETERMINE_SUSPECT,
+			title = "Tentukan Pelaku",
+			description = "Gunakan bukti untuk menentukan pelaku pencurian.",
+			target = 1,
+			checkpoint = GameConfig.Checkpoints.ENDING_CHOICE,
+		},
+	},
+	Medium = {
+		{
+			id = "brief_pak_rt",
+			type = GameConfig.Objectives.Types.BRIEFING,
+			title = "Terima Tugas Ronda",
+			description = "Pak RT mengubah aturan setoran malam ini.",
+			target = 1,
+			checkpoint = GameConfig.Checkpoints.INTRO_COMPLETE,
+		},
+		{
+			id = "collect_jimpitan_medium",
+			type = GameConfig.Objectives.Types.COLLECT_JIMPITAN,
+			title = "Setor Langsung",
+			description = "Kumpulkan jimpitan dan setor dengan hati-hati.",
+			target = 7,
+			checkpoint = GameConfig.Checkpoints.JIMPITAN_COLLECTED,
+		},
+		{
+			id = "compare_clues_medium",
+			type = GameConfig.Objectives.Types.FIND_CLUE,
+			title = "Bandingkan Bukti",
+			description = "Pisahkan bukti nyata dari bayangan yang menyesatkan.",
+			target = 4,
+			checkpoint = GameConfig.Checkpoints.KEY_CLUE_FOUND,
+		},
+		{
+			id = "solve_shadow_medium",
+			type = GameConfig.Objectives.Types.SOLVE_PUZZLE,
+			title = "Uji Arah Bayangan",
+			description = "Cari tahu apakah Mas Agus benar-benar terlihat di jendela.",
+			target = 1,
+		},
+		{
+			id = "accuse_medium",
+			type = GameConfig.Objectives.Types.DETERMINE_SUSPECT,
+			title = "Pilih Jalur Kebenaran",
+			description = "Tentukan apakah kasus ini manusia biasa atau pesugihan.",
+			target = 1,
+			checkpoint = GameConfig.Checkpoints.ENDING_CHOICE,
+		},
+	},
+	Hard = {
+		{
+			id = "brief_pak_rt",
+			type = GameConfig.Objectives.Types.BRIEFING,
+			title = "Desa Tidak Aman",
+			description = "Pak RT meminta bukti, bukan tuduhan.",
+			target = 1,
+			checkpoint = GameConfig.Checkpoints.INTRO_COMPLETE,
+		},
+		{
+			id = "collect_jimpitan_hard",
+			type = GameConfig.Objectives.Types.COLLECT_JIMPITAN,
+			title = "Ronda Penuh",
+			description = "Kumpulkan semua jimpitan sebelum warga kehilangan sabar.",
+			target = 8,
+			checkpoint = GameConfig.Checkpoints.JIMPITAN_COLLECTED,
+		},
+		{
+			id = "map_pattern_hard",
+			type = GameConfig.Objectives.Types.INVESTIGATE_AREA,
+			title = "Petakan Pola Hilang",
+			description = "Tandai rumah, gang, dan area ritual yang saling terhubung.",
+			target = 3,
+		},
+		{
+			id = "collect_key_clues_hard",
+			type = GameConfig.Objectives.Types.FIND_CLUE,
+			title = "Kumpulkan Bukti Kunci",
+			description = "Buktikan konflik manusia dan ritual pesugihan.",
+			target = 7,
+			checkpoint = GameConfig.Checkpoints.KEY_CLUE_FOUND,
+		},
+		{
+			id = "solve_ritual_hard",
+			type = GameConfig.Objectives.Types.SOLVE_PUZZLE,
+			title = "Buka Pola Ritual",
+			description = "Susun tanda ritual tanpa memicu kepanikan warga.",
+			target = 1,
+			checkpoint = GameConfig.Checkpoints.PRE_CLIMAX,
+		},
+		{
+			id = "accuse_hard",
+			type = GameConfig.Objectives.Types.DETERMINE_SUSPECT,
+			title = "Ungkap Kebenaran Penuh",
+			description = "Tentukan pelaku manusia dan keterlibatan ritual.",
+			target = 1,
+			checkpoint = GameConfig.Checkpoints.ENDING_CHOICE,
+		},
+	},
+}
+
+function ObjectiveData.GetChain(difficulty: string)
+	return ObjectiveData.Chains[difficulty] or ObjectiveData.Chains.Easy
+end
+
+return ObjectiveData
+]====]
+    },
+    {
+        path = "game.ReplicatedStorage.Modules.Data.WorldData",
+        className = "ModuleScript",
+        content = [====[--!strict
+
+local GameConfig = require(script.Parent.Parent.GameConfig)
+
+local WorldData = {}
+
+WorldData.Map = {
+	size = GameConfig.World.MAP_SIZE,
+	halfSize = GameConfig.World.MAP_HALF_SIZE,
+	baseplateHeight = GameConfig.World.BASEPLATE_HEIGHT,
+}
+
+WorldData.Lobby = {
+	MapName = "Night Ronda Lobby - Bojongsari",
+	Spawn = Vector3.new(0, 4, 910),
+	QueuePads = {
+		Easy = {
+			position = GameConfig.Queue.PAD_POSITIONS.Easy,
+			color = Color3.fromRGB(74, 180, 117),
+			label = "EASY QUEUE / MODAL EASY",
+			description = "Clue jelas, konflik sosial, horror ringan.",
+			doorPosition = Vector3.new(-860, 10, -300),
+		},
+		Medium = {
+			position = GameConfig.Queue.PAD_POSITIONS.Medium,
+			color = Color3.fromRGB(219, 166, 69),
+			label = "MEDIUM QUEUE / MODAL MEDIUM",
+			description = "Clue ambigu, false clue, jalur manusia atau pesugihan.",
+			doorPosition = Vector3.new(0, 10, -860),
+		},
+		Hard = {
+			position = GameConfig.Queue.PAD_POSITIONS.Hard,
+			color = Color3.fromRGB(184, 57, 72),
+			label = "HARD QUEUE / MODAL HARD",
+			description = "Multi-layer mystery, entity aktif, trust sangat sensitif.",
+			doorPosition = Vector3.new(860, 10, -300),
+		},
+	},
+	BuilderMarkers = {
+		{ id = "baseplate", label = "BASEPLATE 2048x2048x16 STUD / DARK GREY GRID", position = Vector3.new(0, 0.2, 0), size = Vector3.new(2048, 0.2, 2048), color = Color3.fromRGB(58, 67, 72) },
+		{ id = "spawn", label = "SPAWN LOCATION / SAFE ZONE", position = Vector3.new(0, 0.45, 910), size = Vector3.new(180, 0.25, 120), color = Color3.fromRGB(70, 112, 126) },
+		{ id = "safe_hangout", label = "AREA SAFE ZONE & HANG-OUT / RENTAN JIMPITAN", position = Vector3.new(0, 0.45, 210), size = Vector3.new(760, 0.25, 520), color = Color3.fromRGB(92, 78, 52) },
+		{ id = "mode_board", label = "PILIHAN MODE KE DESA BOJONGSARI / NIGHT RONDA", position = Vector3.new(0, 0.5, -360), size = Vector3.new(680, 0.25, 210), color = Color3.fromRGB(55, 63, 66) },
+		{ id = "easy_match", label = "KOTAK MATCH EASY / SLOT P1-P4 / SESSION A-B", position = Vector3.new(-760, 0.55, -80), size = Vector3.new(290, 0.25, 180), color = Color3.fromRGB(44, 78, 58) },
+		{ id = "hard_match", label = "KOTAK MATCH HARD / SLOT P1-P4 / SESSION A-B", position = Vector3.new(760, 0.55, -80), size = Vector3.new(290, 0.25, 180), color = Color3.fromRGB(83, 45, 49) },
+		{ id = "shop", label = "SHOP PERLENGKAPAN RONDA / SENTER, KENTONGAN, ITEMS", position = Vector3.new(-610, 0.55, 270), size = Vector3.new(300, 0.25, 220), color = Color3.fromRGB(88, 66, 44) },
+		{ id = "leaderboard", label = "LEADERBOARD DONASI JIMPITAN", position = Vector3.new(620, 0.55, 270), size = Vector3.new(280, 0.25, 210), color = Color3.fromRGB(50, 67, 62) },
+		{ id = "banyan", label = "BANYAN TREE / LANDMARK LOBBY", position = Vector3.new(-560, 0.55, -520), size = Vector3.new(260, 0.25, 220), color = Color3.fromRGB(38, 76, 52) },
+		{ id = "bamboo_zone", label = "ZONA BAMBU DEKORATIF", position = Vector3.new(620, 0.55, -620), size = Vector3.new(350, 0.25, 300), color = Color3.fromRGB(38, 78, 48) },
+		{ id = "forest_boundary", label = "HUTAN DESA / SAFE BOUNDARY", position = Vector3.new(0, 0.55, 0), size = Vector3.new(1980, 0.25, 1980), color = Color3.fromRGB(31, 58, 43), outlineOnly = true },
+	},
+	Structures = {
+		{ id = "pos_lobby", label = "POS RONDA LOBBY / PUSAT INFO", position = Vector3.new(0, 8, 210), size = Vector3.new(260, 16, 150), color = Color3.fromRGB(80, 56, 37), material = Enum.Material.WoodPlanks },
+		{ id = "notice_board", label = "PAPAN PENGUMUMAN & MISI RONDA ARC 1-2", position = Vector3.new(0, 26, 10), size = Vector3.new(360, 70, 8), color = Color3.fromRGB(38, 32, 28), material = Enum.Material.Wood },
+		{ id = "shop_hut", label = "BLOCKOUT SHOP / GANTI DENGAN MODEL FINAL", position = Vector3.new(-610, 8, 270), size = Vector3.new(180, 16, 130), color = Color3.fromRGB(73, 52, 36), material = Enum.Material.WoodPlanks },
+		{ id = "leaderboard_board", label = "PAPAN LEADERBOARD DONASI", position = Vector3.new(620, 24, 270), size = Vector3.new(170, 82, 8), color = Color3.fromRGB(32, 39, 39), material = Enum.Material.SmoothPlastic },
+	},
+}
+
+WorldData.Village = {
+	MapName = "Night Ronda Bojongsari",
+	Spawn = Vector3.new(-51, 13, -600),
+	MainGate = Vector3.new(0, 0, 820),
+	Checkpoints = {
+		intro_complete = Vector3.new(-51, 13, -638),
+		jimpitan_collected = Vector3.new(-51, 13, -638),
+		first_clue_found = Vector3.new(-757, 30, -226),
+		key_clue_found = Vector3.new(554, 34, -233),
+		suspect_identified = Vector3.new(669, 15, 573),
+		pre_climax = Vector3.new(-51, 13, -638),
+		ending_choice = Vector3.new(-31, 13, -638),
+	},
+	Houses = {
+		{ id = "house_01_bu_siti", owner = "bu_siti", label = "RUMAH WARGA 01 / BU SITI / KORBAN", position = Vector3.new(-757, 30, -226), rotation = 18 },
+		{ id = "house_02_mas_agus", owner = "mas_agus", label = "RUMAH WARGA 02 / MAS AGUS / FALSE SUSPECT", position = Vector3.new(-614, 25, -421), rotation = 35 },
+		{ id = "house_03_warga", owner = "none", label = "RUMAH WARGA 03 / JIMPITAN ROUTE", position = Vector3.new(-78, 28, -534), rotation = 8 },
+		{ id = "house_04_bu_ani", owner = "bu_ani", label = "RUMAH WARGA 04 / BU ANI / SAKSI GOSIP", position = Vector3.new(158, 38, -2), rotation = -8 },
+		{ id = "house_05_pak_joko", owner = "pak_joko", label = "RUMAH WARGA 05 / PAK JOKO / SUSPECT", position = Vector3.new(554, 34, -233), rotation = -30 },
+		{ id = "house_06_warga", owner = "none", label = "RUMAH WARGA 06 / ROUTE TIMUR", position = Vector3.new(669, 15, 188), rotation = -82 },
+		{ id = "house_07_mbah_darmo", owner = "mbah_darmo", label = "RUMAH WARGA 07 / MBAH DARMO / SAKSI MISTIS", position = Vector3.new(669, 15, 573), rotation = -138 },
+		{ id = "house_08_pak_rt", owner = "pak_rt", label = "RUMAH PAK RT / MENTOR & REPORTING", position = Vector3.new(-533, 29, 585), rotation = 145 },
+	},
+	NPCs = {
+		{ id = "pak_rt", label = "NPC PAK RT / BRIEFING", position = Vector3.new(-510, 29, 585) },
+		{ id = "bu_siti", label = "NPC BU SITI / KORBAN", position = Vector3.new(-740, 30, -210) },
+		{ id = "mas_agus", label = "NPC MAS AGUS / FALSE SUSPECT", position = Vector3.new(-600, 25, -410) },
+		{ id = "pak_joko", label = "NPC PAK JOKO / SUSPECT UTAMA", position = Vector3.new(540, 34, -220) },
+		{ id = "bu_ani", label = "NPC BU ANI / SAKSI GOSIP", position = Vector3.new(170, 38, -10) },
+		{ id = "mbah_darmo", label = "NPC MBAH DARMO / OCCULT WITNESS", position = Vector3.new(650, 15, 560) },
+	},
+	Areas = {
+		pos_ronda = Vector3.new(-51, 13, -638),
+		central_forest = Vector3.new(0, 0, -40),
+		sumur = Vector3.new(0, 27, 435),
+		ritual = Vector3.new(40, 0, -60),
+		loop_road = Vector3.new(0, 0, -35),
+		bamboo = Vector3.new(690, 0, -720),
+		rumah_kosong = Vector3.new(669, 15, 188),
+		banyan = Vector3.new(570, 15, 720),
+		main_gate = Vector3.new(0, 0, 820),
+		forest_boundary = Vector3.new(0, 0, 0),
+	},
+	BuilderMarkers = {
+		{ id = "baseplate", label = "BASEPLATE 2048x2048x16 STUD / NIGHT GRASS GRID", position = Vector3.new(0, 0.2, 0), size = Vector3.new(2048, 0.2, 2048), color = Color3.fromRGB(45, 58, 48) },
+		{ id = "main_gate", label = "GERBANG MASUK DESA / MAIN GATES", position = Vector3.new(0, 0.55, 820), size = Vector3.new(230, 0.25, 140), color = Color3.fromRGB(92, 80, 54) },
+		{ id = "pos_ronda", label = "POS RONDA & CHECKPOINT / ARC 1", position = Vector3.new(-51, 13, -638), size = Vector3.new(270, 0.25, 170), color = Color3.fromRGB(101, 73, 45) },
+		{ id = "rumah_pak_rt", label = "RUMAH PAK RT / MENTOR REPORTING", position = Vector3.new(-533, 29, 585), size = Vector3.new(220, 0.25, 170), color = Color3.fromRGB(80, 61, 43) },
+		{ id = "jalan_lingkar", label = "JALAN LINGKAR DESA / RUTE PATROLI", position = Vector3.new(0, 0.55, -35), size = Vector3.new(1420, 0.25, 1420), color = Color3.fromRGB(90, 72, 50), outlineOnly = true },
+		{ id = "hutan_tengah", label = "HUTAN TENGAH / CENTRAL FOREST", position = Vector3.new(0, 0.55, -40), size = Vector3.new(780, 0.25, 760), color = Color3.fromRGB(28, 70, 45) },
+		{ id = "sumur", label = "SUMUR / RITUAL PESUGIHAN & FALSE CLUE LOC", position = Vector3.new(0, 27, 435), size = Vector3.new(120, 0.25, 120), color = Color3.fromRGB(51, 54, 54) },
+		{ id = "bamboo_grove", label = "ZONA BAMBU / BAMBOO GROVE", position = Vector3.new(690, 0.55, -720), size = Vector3.new(360, 0.25, 270), color = Color3.fromRGB(37, 82, 48) },
+		{ id = "rumah_kosong", label = "RUMAH KOSONG / LOKASI MISTERI / FALSE CLUE LOC", position = Vector3.new(669, 15, 188), size = Vector3.new(230, 0.25, 170), color = Color3.fromRGB(58, 58, 52) },
+		{ id = "banyan_tree", label = "POHON BERINGIN BESAR / BANYAN TREE", position = Vector3.new(570, 15, 720), size = Vector3.new(230, 0.25, 200), color = Color3.fromRGB(32, 75, 49) },
+		{ id = "hutan_batas", label = "HUTAN DESA / MAP BOUNDARY", position = Vector3.new(0, 0.55, 0), size = Vector3.new(1980, 0.25, 1980), color = Color3.fromRGB(31, 63, 45), outlineOnly = true },
+	},
+	Clues = {
+		{ id = "empty_can_siti", position = Vector3.new(-770, 30, -230) },
+		{ id = "ledger_erased", position = Vector3.new(-60, 13, -630) },
+		{ id = "muddy_sandals", position = Vector3.new(570, 34, -240) },
+		{ id = "false_shadow_agus", position = Vector3.new(-630, 25, -430) },
+		{ id = "coin_circle", position = Vector3.new(680, 15, 170) },
+		{ id = "wet_footprints", position = Vector3.new(180, 38, 10) },
+		{ id = "debt_note", position = Vector3.new(580, 34, -220) },
+		{ id = "ritual_receipt", position = Vector3.new(20, 27, 410) },
+		{ id = "contradicting_alibi", position = Vector3.new(140, 38, -20) },
+		{ id = "ritual_token", position = Vector3.new(650, 15, 590) },
+	},
+	Puzzles = {
+		{ id = "kentongan_pattern", position = Vector3.new(-45, 13, -630) },
+		{ id = "window_shadow", position = Vector3.new(-610, 25, -415) },
+		{ id = "ritual_symbols", position = Vector3.new(0, 27, 435) },
+	},
+}
+
+return WorldData
+]====]
+    },
+    {
         path = "game.ReplicatedStorage.Modules.Net.RemoteDefinitions",
         className = "ModuleScript",
         content = [====[-- ReplicatedStorage/Modules/Net/RemoteDefinitions.lua
@@ -2654,6 +4007,7 @@ return {
 	"Night/TimeUpdated",
 	"Night/TimeUp",
 	"Interaction/Locked",
+	"Jimpitan/Spawns",
 
 	-- Client -> Server
 	"Dialogue/Choose",
@@ -2756,6 +4110,145 @@ AttributeConstants.Attributes = {
 }
 
 return AttributeConstants
+]====]
+    },
+    {
+        path = "game.ReplicatedStorage.Modules.Util.MarkerBuilder",
+        className = "ModuleScript",
+        content = [====[-- ReplicatedStorage/Modules/Util/MarkerBuilder.lua
+-- Shared helper for spawning glowing world-space interactable markers, used by
+-- JimpitanSpawnerService and WorldObjectSpawnerService so every auto-generated
+-- interactable looks/feels consistent until final art replaces it.
+--
+-- Idempotent by design: EnsureMarker never touches a part that already exists under
+-- `parent` with that name -- so map authors can permanently hand-replace any
+-- auto-generated marker (swap it for real art, move it, whatever) and this will never
+-- overwrite their work on a later server start.
+
+local RunService = game:GetService("RunService")
+
+local MarkerBuilder = {}
+
+local bobbingParts = {} -- { { part, baseY, phase } }
+local heartbeatConnection
+
+local function ensureHeartbeat()
+	if heartbeatConnection then
+		return
+	end
+	heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
+		local t = os.clock()
+		for _, entry in ipairs(bobbingParts) do
+			local part = entry.part
+			if part and part.Parent then
+				local pos = part.Position
+				local bob = math.sin(t * 1.6 + entry.phase) * 0.35
+				part.CFrame = CFrame.new(pos.X, entry.baseY + bob, pos.Z) * entry.rotation * CFrame.Angles(0, t * 0.6 + entry.phase, 0)
+			end
+		end
+	end)
+end
+
+-- props: Position (Vector3, required), Shape, Size, Color, Material, LightColor,
+-- LightRange, LightBrightness, Icon (emoji/text for a floating BillboardGui), NameLabel
+-- (a name plate instead of/alongside Icon), ActionText, ObjectText, HoldDuration,
+-- MaxActivationDistance, Attributes (table of attribute name -> value), Bob (default
+-- true; set false for flat/ground markers like checkpoints), ExtraRotation (CFrame
+-- rotation applied on top of Position, only at creation time).
+function MarkerBuilder.EnsureMarker(parent, name, props)
+	local existing = parent:FindFirstChild(name)
+	if existing then
+		return existing, false
+	end
+
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Anchored = true
+	part.CanCollide = false
+	part.Shape = props.Shape or Enum.PartType.Block
+	part.Size = props.Size or Vector3.new(1.4, 1.4, 1.4)
+	part.Color = props.Color or Color3.fromRGB(255, 200, 90)
+	part.Material = props.Material or Enum.Material.Neon
+	part.CFrame = CFrame.new(props.Position) * (props.ExtraRotation or CFrame.new())
+	part.Parent = parent
+
+	local light = Instance.new("PointLight")
+	light.Color = props.LightColor or part.Color
+	light.Range = props.LightRange or 10
+	light.Brightness = props.LightBrightness or 2
+	light.Parent = part
+
+	if props.Icon then
+		local billboard = Instance.new("BillboardGui")
+		billboard.Name = "Icon"
+		billboard.Size = UDim2.fromOffset(40, 40)
+		billboard.StudsOffset = Vector3.new(0, 1.8, 0)
+		billboard.AlwaysOnTop = true
+		billboard.Parent = part
+
+		local label = Instance.new("TextLabel")
+		label.BackgroundTransparency = 1
+		label.Size = UDim2.fromScale(1, 1)
+		label.Text = props.Icon
+		label.TextScaled = true
+		label.Parent = billboard
+	end
+
+	if props.NameLabel then
+		local nameBoard = Instance.new("BillboardGui")
+		nameBoard.Name = "NameLabel"
+		nameBoard.Size = UDim2.fromOffset(160, 40)
+		nameBoard.StudsOffset = Vector3.new(0, 3.2, 0)
+		nameBoard.AlwaysOnTop = true
+		nameBoard.Parent = part
+
+		local frame = Instance.new("Frame")
+		frame.BackgroundTransparency = 0.35
+		frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+		frame.BorderSizePixel = 0
+		frame.Size = UDim2.fromScale(1, 1)
+		frame.Parent = nameBoard
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 6)
+		corner.Parent = frame
+
+		local label = Instance.new("TextLabel")
+		label.BackgroundTransparency = 1
+		label.TextColor3 = Color3.fromRGB(235, 230, 220)
+		label.Font = Enum.Font.GothamBold
+		label.Size = UDim2.fromScale(1, 1)
+		label.Text = props.NameLabel
+		label.TextScaled = true
+		label.Parent = frame
+	end
+
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.ActionText = props.ActionText or "Interaksi"
+	prompt.ObjectText = props.ObjectText or ""
+	prompt.HoldDuration = props.HoldDuration or 0.25
+	prompt.MaxActivationDistance = props.MaxActivationDistance or 9
+	prompt.RequiresLineOfSight = false
+	prompt.Parent = part
+
+	for attrName, attrValue in pairs(props.Attributes or {}) do
+		part:SetAttribute(attrName, attrValue)
+	end
+
+	if props.Bob ~= false then
+		table.insert(bobbingParts, {
+			part = part,
+			baseY = props.Position.Y,
+			phase = math.random() * 6.28,
+			rotation = props.ExtraRotation or CFrame.new(),
+		})
+		ensureHeartbeat()
+	end
+
+	return part, true
+end
+
+return MarkerBuilder
 ]====]
     },
     {
