@@ -61,6 +61,7 @@ local function spawnClues(gameplay)
 			ActionText = "Periksa",
 			ObjectText = data and data.displayName or "Petunjuk",
 			MaxActivationDistance = 8,
+			GroundExclude = gameplay,
 			Attributes = {
 				[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.Clue,
 				[AttributeConstants.Attributes.ClueId] = clue.id,
@@ -90,6 +91,7 @@ local function spawnPuzzles(gameplay)
 			ActionText = "Pecahkan",
 			ObjectText = data and data.displayName or "Teka-teki",
 			MaxActivationDistance = 9,
+			GroundExclude = gameplay,
 			Attributes = attrs,
 		})
 	end
@@ -110,6 +112,7 @@ local function spawnNPCs(gameplay)
 			ObjectText = dialogue and dialogue.displayName or "Warga",
 			MaxActivationDistance = 9,
 			Bob = false,
+			GroundExclude = gameplay,
 			Attributes = {
 				[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.NPC,
 				[AttributeConstants.Attributes.NPCId] = npc.id,
@@ -133,6 +136,8 @@ local function spawnCheckpoints(gameplay)
 			MaxActivationDistance = 12,
 			Bob = false,
 			ExtraRotation = FLAT,
+			GroundExclude = gameplay,
+			GroundClearance = 0.15, -- half the disc's true thickness once rotated flat
 			Attributes = {
 				[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.Checkpoint,
 				[AttributeConstants.Attributes.CheckpointId] = id,
@@ -158,6 +163,7 @@ local function spawnAccusationBoard(gameplay)
 		ObjectText = "Papan Tuduhan",
 		MaxActivationDistance = 10,
 		Bob = false,
+		GroundExclude = gameplay,
 		Attributes = {
 			[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.AccusationBoard,
 		},

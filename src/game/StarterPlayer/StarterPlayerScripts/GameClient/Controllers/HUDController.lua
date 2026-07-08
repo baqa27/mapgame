@@ -147,6 +147,12 @@ function HUDController.Start()
 		rebuildJimpitanMarkers(data.spawns or {})
 	end)
 
+	-- Ask the server for the current snapshot now that we're guaranteed to be listening.
+	-- Fixes jimpitan never appearing on the minimap on join: the server also pushes one
+	-- via task.defer right after PlayerAdded, but that can land before this connection
+	-- above even exists, and a RemoteEvent fired with nobody listening is simply lost.
+	RemoteRegistry.Get("Jimpitan/RequestSnapshot"):FireServer()
+
 	-- North-up minimap: only the player arrow rotates to show facing. dx maps to
 	-- east/west (left/right), dz maps to north/south (up/down) with -Z treated as
 	-- "north" (up on screen) -- flip this mapping here if the built map's compass

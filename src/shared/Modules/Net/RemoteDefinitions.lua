@@ -33,4 +33,7 @@ return {
 	"Dialogue/Choose",
 	"Puzzle/Submit",
 	"Accusation/Submit",
+	"Jimpitan/RequestSnapshot", -- fired once by HUDController after it's connected and
+	-- ready to receive Jimpitan/Spawns, so the initial minimap snapshot can never be lost
+	-- to a race between server push and client listener setup (see JimpitanSpawnerService).
 }

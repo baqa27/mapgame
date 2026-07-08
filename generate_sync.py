@@ -75,29 +75,39 @@ lines.append(r'''local function getOrCreatePath(pathStr, className)
 
 	local targetName = parts[#parts]
 	local target = current:FindFirstChild(targetName)
+	local isNew = false
 	if not target then
 		target = Instance.new(className)
 		target.Name = targetName
 		target.Parent = current
+		isNew = true
 	elseif target.ClassName ~= className then
 		target:Destroy()
 		target = Instance.new(className)
 		target.Name = targetName
 		target.Parent = current
+		isNew = true
 	end
 
-	return target
+	return target, isNew
 end
 
-local created = 0
+-- Three distinct outcomes so the printed report actually tells you whether the sync did
+-- anything: reallyCreated (brand-new instance), updated (existed, Source changed),
+-- unchanged (existed, Source already matched -- e.g. you ran sync twice in a row).
+local reallyCreated = 0
 local updated = 0
+local unchanged = 0
 for _, file in ipairs(files) do
-	local target = getOrCreatePath(file.path, file.className)
-	if target.Source ~= file.content then
+	local target, isNew = getOrCreatePath(file.path, file.className)
+	if isNew then
+		target.Source = file.content
+		reallyCreated = reallyCreated + 1
+	elseif target.Source ~= file.content then
 		target.Source = file.content
 		updated = updated + 1
 	else
-		created = created + 1
+		unchanged = unchanged + 1
 	end
 end
 
@@ -114,7 +124,7 @@ if oldAI then
 	end
 end
 
-return "Sync complete. Created/Verified: " .. created .. ", Updated: " .. updated''')
+return "Sync complete. New: " .. reallyCreated .. ", Updated: " .. updated .. ", Unchanged: " .. unchanged''')
 
 OUTPUT_FILE.write_text("\n".join(lines), encoding="utf-8")
 print(f"Wrote {OUTPUT_FILE} with {len(entries)} packaged files")

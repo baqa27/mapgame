@@ -73,6 +73,8 @@ local function spawnAll()
 			ObjectText = "Jimpitan",
 			MaxActivationDistance = 8,
 			ExtraRotation = UPRIGHT,
+			GroundExclude = folder.Parent, -- shared Gameplay folder, don't snap onto sibling markers
+			GroundClearance = 0.65, -- half the cylinder's true height once rotated upright
 			Attributes = {
 				[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.Jimpitan,
 				[AttributeConstants.Attributes.JimpitanId] = id,
@@ -85,6 +87,16 @@ end
 function JimpitanSpawnerService.Init(services)
 	Services = services
 	task.spawn(spawnAll)
+
+	-- Pull-based snapshot: the one-shot push from Bootstrap.server.lua's
+	-- task.defer(SendSnapshot) can fire before the client's HUDController has even
+	-- connected its Jimpitan/Spawns listener (client scripts take a moment to load,
+	-- especially on first join) -- an event fired before anyone's listening is just
+	-- lost, so the minimap would show zero jimpitan until the player found one blind.
+	-- The client now explicitly asks for a snapshot once it's actually ready.
+	RemoteRegistry.Get("Jimpitan/RequestSnapshot").OnServerEvent:Connect(function(player)
+		JimpitanSpawnerService.SendSnapshot(player)
+	end)
 end
 
 function JimpitanSpawnerService.GetActiveSpawns()

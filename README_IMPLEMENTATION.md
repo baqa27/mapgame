@@ -1,5 +1,47 @@
 # Implementation Notes — Main Game Scripting + UI (v4)
 
+## v5 changelog — marker overlap, ground-snapping, jimpitan minimap race
+
+Triggered by a Studio playtest screenshot showing a Clue icon overlapping an NPC's
+name plate, plus a report that jimpitan pickups never show up on the minimap and that
+item placement generally looks wrong (floating / sunken into the ground).
+
+**Root causes found (all three confirmed by reading the actual code, not guessed):**
+
+1. `MarkerBuilder`'s Icon and NameLabel `BillboardGui`s had no `MaxDistance` -- clues are
+   deliberately placed close to their witness NPC (by design, ~20-30 studs apart), and
+   at any camera distance beyond close-up the two fixed-pixel billboards visually
+   collided. Fixed by giving Icon a shorter `MaxDistance` (35 studs) than NameLabel (70
+   studs) -- applied on both the create path and the idempotent-update path, so a re-sync
+   fixes markers that already exist.
+2. **The runtime spawners (`JimpitanSpawnerService`, `WorldObjectSpawnerService`) never
+   raycast markers onto real ground** -- they placed every marker at WorldData's raw
+   (guessed) Y coordinate. A *separate*, manually-run tool
+   (`tools/spawn_markers_studio.lua`) already had the raycasting logic, but nothing forced
+   anyone to run it, and the two systems used slightly different map-folder-resolution
+   fallbacks. Moved ground-snapping directly into `MarkerBuilder.EnsureMarker` (raycasts
+   once, only for newly-created parts, excluding the shared Gameplay folder so it never
+   snaps onto a sibling marker) -- this now happens automatically on every server start,
+   for every marker type, with no manual step. `spawn_markers_studio.lua` is kept only as
+   a one-off bulk re-align tool for markers created *before* this fix (see its header).
+3. **Jimpitan markers never appeared on a fresh join's minimap.** `Bootstrap.server.lua`
+   pushed the initial snapshot via `task.defer` right after `PlayerAdded`, which can (and
+   often does) fire before the client's `HUDController` has connected its
+   `Jimpitan/Spawns` listener -- an event fired before anyone's listening is simply lost,
+   with no error. After that, the only other broadcast trigger was `Collect()`, so a
+   solo/first-time player would never see jimpitan on the minimap at all (they'd have to
+   find one blind before the map would show any). Added a new client -> server remote,
+   `Jimpitan/RequestSnapshot`: `HUDController` fires it right after connecting its
+   listener, guaranteeing correct ordering regardless of how long client scripts take to
+   load. The original `task.defer` push is left in place as a harmless first attempt.
+
+**If you already have markers placed in Studio from before this fix:** ground-snapping
+only runs when `MarkerBuilder.EnsureMarker` *creates* a part (idempotence means it never
+touches an existing one), so already-existing floating/sunken markers won't self-correct.
+Delete the stale ones under `Workspace.Map.Gameplay` (or `Workspace.Maps.*.Gameplay`) in
+Studio's Explorer, then re-sync + Play -- the spawners will recreate them correctly this
+time.
+
 ## v4 changelog — integration fix + world spawners + FF-style minimap + UI polish
 
 This pass started from a Studio playtest screenshot: bare UI text boxes, an empty

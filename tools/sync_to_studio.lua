@@ -1052,6 +1052,8 @@ local function spawnAll()
 			ObjectText = "Jimpitan",
 			MaxActivationDistance = 8,
 			ExtraRotation = UPRIGHT,
+			GroundExclude = folder.Parent, -- shared Gameplay folder, don't snap onto sibling markers
+			GroundClearance = 0.65, -- half the cylinder's true height once rotated upright
 			Attributes = {
 				[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.Jimpitan,
 				[AttributeConstants.Attributes.JimpitanId] = id,
@@ -1064,6 +1066,16 @@ end
 function JimpitanSpawnerService.Init(services)
 	Services = services
 	task.spawn(spawnAll)
+
+	-- Pull-based snapshot: the one-shot push from Bootstrap.server.lua's
+	-- task.defer(SendSnapshot) can fire before the client's HUDController has even
+	-- connected its Jimpitan/Spawns listener (client scripts take a moment to load,
+	-- especially on first join) -- an event fired before anyone's listening is just
+	-- lost, so the minimap would show zero jimpitan until the player found one blind.
+	-- The client now explicitly asks for a snapshot once it's actually ready.
+	RemoteRegistry.Get("Jimpitan/RequestSnapshot").OnServerEvent:Connect(function(player)
+		JimpitanSpawnerService.SendSnapshot(player)
+	end)
 end
 
 function JimpitanSpawnerService.GetActiveSpawns()
@@ -1712,6 +1724,7 @@ local function spawnClues(gameplay)
 			ActionText = "Periksa",
 			ObjectText = data and data.displayName or "Petunjuk",
 			MaxActivationDistance = 8,
+			GroundExclude = gameplay,
 			Attributes = {
 				[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.Clue,
 				[AttributeConstants.Attributes.ClueId] = clue.id,
@@ -1741,6 +1754,7 @@ local function spawnPuzzles(gameplay)
 			ActionText = "Pecahkan",
 			ObjectText = data and data.displayName or "Teka-teki",
 			MaxActivationDistance = 9,
+			GroundExclude = gameplay,
 			Attributes = attrs,
 		})
 	end
@@ -1761,6 +1775,7 @@ local function spawnNPCs(gameplay)
 			ObjectText = dialogue and dialogue.displayName or "Warga",
 			MaxActivationDistance = 9,
 			Bob = false,
+			GroundExclude = gameplay,
 			Attributes = {
 				[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.NPC,
 				[AttributeConstants.Attributes.NPCId] = npc.id,
@@ -1784,6 +1799,8 @@ local function spawnCheckpoints(gameplay)
 			MaxActivationDistance = 12,
 			Bob = false,
 			ExtraRotation = FLAT,
+			GroundExclude = gameplay,
+			GroundClearance = 0.15, -- half the disc's true thickness once rotated flat
 			Attributes = {
 				[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.Checkpoint,
 				[AttributeConstants.Attributes.CheckpointId] = id,
@@ -1809,6 +1826,7 @@ local function spawnAccusationBoard(gameplay)
 		ObjectText = "Papan Tuduhan",
 		MaxActivationDistance = 10,
 		Bob = false,
+		GroundExclude = gameplay,
 		Attributes = {
 			[AttributeConstants.Attributes.InteractionType] = AttributeConstants.InteractionType.AccusationBoard,
 		},
@@ -2556,6 +2574,12 @@ function HUDController.Start()
 	RemoteRegistry.Get("Jimpitan/Spawns").OnClientEvent:Connect(function(data)
 		rebuildJimpitanMarkers(data.spawns or {})
 	end)
+
+	-- Ask the server for the current snapshot now that we're guaranteed to be listening.
+	-- Fixes jimpitan never appearing on the minimap on join: the server also pushes one
+	-- via task.defer right after PlayerAdded, but that can land before this connection
+	-- above even exists, and a RemoteEvent fired with nobody listening is simply lost.
+	RemoteRegistry.Get("Jimpitan/RequestSnapshot"):FireServer()
 
 	-- North-up minimap: only the player arrow rotates to show facing. dx maps to
 	-- east/west (left/right), dz maps to north/south (up/down) with -Z treated as
@@ -4039,6 +4063,9 @@ return {
 	"Dialogue/Choose",
 	"Puzzle/Submit",
 	"Accusation/Submit",
+	"Jimpitan/RequestSnapshot", -- fired once by HUDController after it's connected and
+	-- ready to receive Jimpitan/Spawns, so the initial minimap snapshot can never be lost
+	-- to a race between server push and client listener setup (see JimpitanSpawnerService).
 }
 ]====]
     },
@@ -4150,8 +4177,17 @@ return AttributeConstants
 -- `parent` with that name -- so map authors can permanently hand-replace any
 -- auto-generated marker (swap it for real art, move it, whatever) and this will never
 -- overwrite their work on a later server start.
+--
+-- Ground-snapping: WorldData's Y coordinates were written without ever seeing the
+-- environment team's actual built geometry, so they're best-effort guesses. To avoid
+-- markers floating in mid-air or clipping into floors/walls, every NEWLY created marker
+-- (never re-snapped later -- idempotence rule above still applies) raycasts straight
+-- down from well above its configured position and, if it hits real world geometry,
+-- rests on that surface instead of trusting the raw Y. Pass SnapToGround = false in
+-- props to opt a marker out (e.g. something intentionally floating/elevated).
 
 local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
 
 local MarkerBuilder = {}
 
@@ -4175,12 +4211,31 @@ local function ensureHeartbeat()
 	end)
 end
 
+-- Casts straight down from 150 studs above `position`, excluding `excludeInstance` (the
+-- Gameplay folder every auto-spawned marker lives under, so a marker never "snaps" onto
+-- a sibling marker instead of real terrain/building geometry). Returns the hit Y, or nil
+-- if nothing was hit within range (e.g. position is way outside the built map).
+local function raycastGroundY(position, excludeInstance)
+	local origin = Vector3.new(position.X, position.Y + 150, position.Z)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = excludeInstance and { excludeInstance } or {}
+	local result = Workspace:Raycast(origin, Vector3.new(0, -400, 0), params)
+	if result then
+		return result.Position.Y
+	end
+	return nil
+end
+
 -- props: Position (Vector3, required), Shape, Size, Color, Material, LightColor,
 -- LightRange, LightBrightness, Icon (emoji/text for a floating BillboardGui), NameLabel
 -- (a name plate instead of/alongside Icon), ActionText, ObjectText, HoldDuration,
 -- MaxActivationDistance, Attributes (table of attribute name -> value), Bob (default
 -- true; set false for flat/ground markers like checkpoints), ExtraRotation (CFrame
--- rotation applied on top of Position, only at creation time).
+-- rotation applied on top of Position, only at creation time), SnapToGround (default
+-- true), GroundExclude (Instance to exclude from the raycast; pass the shared Gameplay
+-- folder), GroundClearance (studs above the raycast hit to rest the part's center --
+-- defaults to half the part's Y size so it sits ON the surface, not embedded in it).
 function MarkerBuilder.EnsureMarker(parent, name, props)
 	local part = parent:FindFirstChild(name)
 	local createdNew = false
@@ -4193,7 +4248,17 @@ function MarkerBuilder.EnsureMarker(parent, name, props)
 		part.Size = props.Size or Vector3.new(1.4, 1.4, 1.4)
 		part.Color = props.Color or Color3.fromRGB(255, 200, 90)
 		part.Material = props.Material or Enum.Material.Neon
-		part.CFrame = CFrame.new(props.Position) * (props.ExtraRotation or CFrame.new())
+
+		local spawnPosition = props.Position
+		if props.SnapToGround ~= false then
+			local groundY = raycastGroundY(props.Position, props.GroundExclude)
+			if groundY then
+				local clearance = props.GroundClearance or (part.Size.Y / 2)
+				spawnPosition = Vector3.new(props.Position.X, groundY + clearance, props.Position.Z)
+			end
+		end
+
+		part.CFrame = CFrame.new(spawnPosition) * (props.ExtraRotation or CFrame.new())
 		part.Parent = parent
 		createdNew = true
 	else
@@ -4219,6 +4284,11 @@ function MarkerBuilder.EnsureMarker(parent, name, props)
 			billboard.Size = UDim2.fromOffset(40, 40)
 			billboard.StudsOffset = Vector3.new(0, 1.8, 0)
 			billboard.AlwaysOnTop = true
+			-- Icons sit close to other interactables narratively (a clue near its
+			-- witness's house, say), so cap render distance shorter than NameLabel's --
+			-- otherwise two nearby markers' fixed-pixel billboards visually collide from
+			-- any camera distance beyond close-up (this was the overlap seen in-game).
+			billboard.MaxDistance = props.IconMaxDistance or 35
 			billboard.Parent = part
 
 			local label = Instance.new("TextLabel")
@@ -4228,6 +4298,7 @@ function MarkerBuilder.EnsureMarker(parent, name, props)
 			label.TextScaled = true
 			label.Parent = billboard
 		else
+			billboard.MaxDistance = props.IconMaxDistance or 35
 			local label = billboard:FindFirstChildOfClass("TextLabel")
 			if label then
 				label.Text = props.Icon
@@ -4243,6 +4314,9 @@ function MarkerBuilder.EnsureMarker(parent, name, props)
 			nameBoard.Size = UDim2.fromOffset(160, 40)
 			nameBoard.StudsOffset = Vector3.new(0, 3.2, 0)
 			nameBoard.AlwaysOnTop = true
+			-- Readable from further out than Icon -- a name plate is the more important
+			-- signal at range, icons are a close-up detail (see Icon block above).
+			nameBoard.MaxDistance = props.NameMaxDistance or 70
 			nameBoard.Parent = part
 
 			local frame = Instance.new("Frame")
@@ -4265,6 +4339,7 @@ function MarkerBuilder.EnsureMarker(parent, name, props)
 			label.TextScaled = true
 			label.Parent = frame
 		else
+			nameBoard.MaxDistance = props.NameMaxDistance or 70
 			local frame = nameBoard:FindFirstChildOfClass("Frame")
 			local label = frame and frame:FindFirstChildOfClass("TextLabel")
 			if label then
@@ -4376,29 +4451,39 @@ local function getOrCreatePath(pathStr, className)
 
 	local targetName = parts[#parts]
 	local target = current:FindFirstChild(targetName)
+	local isNew = false
 	if not target then
 		target = Instance.new(className)
 		target.Name = targetName
 		target.Parent = current
+		isNew = true
 	elseif target.ClassName ~= className then
 		target:Destroy()
 		target = Instance.new(className)
 		target.Name = targetName
 		target.Parent = current
+		isNew = true
 	end
 
-	return target
+	return target, isNew
 end
 
-local created = 0
+-- Three distinct outcomes so the printed report actually tells you whether the sync did
+-- anything: reallyCreated (brand-new instance), updated (existed, Source changed),
+-- unchanged (existed, Source already matched -- e.g. you ran sync twice in a row).
+local reallyCreated = 0
 local updated = 0
+local unchanged = 0
 for _, file in ipairs(files) do
-	local target = getOrCreatePath(file.path, file.className)
-	if target.Source ~= file.content then
+	local target, isNew = getOrCreatePath(file.path, file.className)
+	if isNew then
+		target.Source = file.content
+		reallyCreated = reallyCreated + 1
+	elseif target.Source ~= file.content then
 		target.Source = file.content
 		updated = updated + 1
 	else
-		created = created + 1
+		unchanged = unchanged + 1
 	end
 end
 
@@ -4415,4 +4500,4 @@ if oldAI then
 	end
 end
 
-return "Sync complete. Created/Verified: " .. created .. ", Updated: " .. updated
+return "Sync complete. New: " .. reallyCreated .. ", Updated: " .. updated .. ", Unchanged: " .. unchanged

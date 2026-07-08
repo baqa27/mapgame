@@ -1,4 +1,21 @@
 -- tools/spawn_markers_studio.lua
+--
+-- ** SUPERSEDED as of the ground-snap fix in MarkerBuilder.lua (see commit "Fix marker
+-- billboard overlap and item ground-snapping"). ** The runtime spawners
+-- (JimpitanSpawnerService / WorldObjectSpawnerService, via MarkerBuilder.EnsureMarker)
+-- now raycast every NEWLY created marker onto real ground/floor geometry automatically,
+-- every server start -- no manual command-bar step needed anymore. This was very likely
+-- the cause of "item placement ngawur" (floating/sunken items): if this script was never
+-- run, the runtime spawners used raw guessed WorldData Y coordinates with zero ground
+-- snapping.
+--
+-- Kept here only in case you need a one-off bulk re-align of markers that were already
+-- created before the fix (EnsureMarker's idempotence means it will NOT re-snap parts
+-- that already exist). If you hit that case: delete the stale marker parts under
+-- Workspace.Map.Gameplay (or Workspace.Maps.*.Gameplay) in Studio's Explorer, then just
+-- re-run the game (or re-run tools/sync_to_studio.lua then Play) -- the spawners will
+-- recreate them correctly-snapped. You shouldn't need this script going forward.
+--
 -- Run this in Roblox Studio Edit Mode via Command Bar or MCP execute_luau.
 -- Spawns and aligns all gameplay markers under Workspace.Maps.MainGameMap or LobbyMap.
 -- Uses raycasting to align markers to the ground/terrain so they are never sunken.
