@@ -33,6 +33,8 @@ local NightTimerService = require(ServiceScripts.NightTimerService)
 local JimpitanSpawnerService = require(ServiceScripts.JimpitanSpawnerService)
 local WorldObjectSpawnerService = require(ServiceScripts.WorldObjectSpawnerService)
 local InteractionService = require(ServiceScripts.InteractionService)
+local AudioLightingService = require(ServiceScripts.AudioLightingService)
+local NPCService = require(ServiceScripts.NPCService)
 
 -- Shared registry passed into every Service.Init() so Services can call each other
 -- (e.g. PuzzleService -> InvestigationService) without requiring each other directly.
@@ -52,6 +54,8 @@ local ServiceRegistry = {
 	JimpitanSpawnerService = JimpitanSpawnerService,
 	WorldObjectSpawnerService = WorldObjectSpawnerService,
 	InteractionService = InteractionService,
+	AudioLightingService = AudioLightingService,
+	NPCService = NPCService,
 }
 
 local INIT_ORDER = {
@@ -67,9 +71,11 @@ local INIT_ORDER = {
 	"CaseGenerationService",
 	"AccusationService",
 	"NightTimerService",
-	"JimpitanSpawnerService", -- spawns world content
+	"JimpitanSpawnerService",    -- spawns world content
 	"WorldObjectSpawnerService", -- spawns world content
-	"InteractionService", -- last: wires ProximityPrompts to every Service above
+	"InteractionService",        -- last: wires ProximityPrompts to every Service above
+	"AudioLightingService",      -- cosmetic: torch/lantern flicker
+	"NPCService",                -- cosmetic: NPC idle sway
 }
 
 for _, name in ipairs(INIT_ORDER) do
@@ -101,6 +107,16 @@ local function onPlayerAdded(player)
 	HorrorService.InitPlayer(player)
 	EntityAIService.InitPlayer(player)
 	NightTimerService.InitPlayer(player, difficulty)
+
+	-- Start cosmetic services per-session
+	-- AudioLightingService and NPCService use OOP pattern: .new():Start()
+	-- They are global (not per-player), so only start once on first player join.
+	-- Subsequent joins skip because _running guard in :Start() prevents double-start.
+	local audioInstance = AudioLightingService.new()
+	audioInstance:Start(difficulty)
+
+	local npcInstance = NPCService.new()
+	npcInstance:Start()
 
 	-- World content spawns asynchronously (waits for Workspace.Map); give it a moment
 	-- before snapshotting, otherwise a player who joins instantly could get an empty list.
@@ -317,9 +333,11 @@ function AudioLightingService:Start(difficulty: string)
 	end
 	self._running = true
 
-	local difficultyConfig = GameConfig.GetDifficultyConfig and GameConfig.GetDifficultyConfig(difficulty)
-		or GameConfig.Difficulty[difficulty]
-	local horrorIntensity = (difficultyConfig and difficultyConfig.horrorIntensity) or 0.5
+	local diffConfig = GameConfig.Difficulty[difficulty] or GameConfig.Difficulty.Easy
+	local freqKey = diffConfig.HorrorFrequency or "low"
+	-- Map frequency name to 0-1 intensity for flicker calculations
+	local INTENSITY_MAP = { low = 0.3, medium = 0.6, high = 1.0 }
+	local horrorIntensity = INTENSITY_MAP[freqKey] or 0.3
 
 	Lighting.FogEnd = math.max(70, Lighting.FogEnd - horrorIntensity * 20)
 

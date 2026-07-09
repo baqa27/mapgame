@@ -30,9 +30,11 @@ function AudioLightingService:Start(difficulty: string)
 	end
 	self._running = true
 
-	local difficultyConfig = GameConfig.GetDifficultyConfig and GameConfig.GetDifficultyConfig(difficulty)
-		or GameConfig.Difficulty[difficulty]
-	local horrorIntensity = (difficultyConfig and difficultyConfig.horrorIntensity) or 0.5
+	local diffConfig = GameConfig.Difficulty[difficulty] or GameConfig.Difficulty.Easy
+	local freqKey = diffConfig.HorrorFrequency or "low"
+	-- Map frequency name to 0-1 intensity for flicker calculations
+	local INTENSITY_MAP = { low = 0.3, medium = 0.6, high = 1.0 }
+	local horrorIntensity = INTENSITY_MAP[freqKey] or 0.3
 
 	Lighting.FogEnd = math.max(70, Lighting.FogEnd - horrorIntensity * 20)
 

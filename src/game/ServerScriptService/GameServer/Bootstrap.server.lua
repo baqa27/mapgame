@@ -28,6 +28,8 @@ local NightTimerService = require(ServiceScripts.NightTimerService)
 local JimpitanSpawnerService = require(ServiceScripts.JimpitanSpawnerService)
 local WorldObjectSpawnerService = require(ServiceScripts.WorldObjectSpawnerService)
 local InteractionService = require(ServiceScripts.InteractionService)
+local AudioLightingService = require(ServiceScripts.AudioLightingService)
+local NPCService = require(ServiceScripts.NPCService)
 
 -- Shared registry passed into every Service.Init() so Services can call each other
 -- (e.g. PuzzleService -> InvestigationService) without requiring each other directly.
@@ -47,6 +49,8 @@ local ServiceRegistry = {
 	JimpitanSpawnerService = JimpitanSpawnerService,
 	WorldObjectSpawnerService = WorldObjectSpawnerService,
 	InteractionService = InteractionService,
+	AudioLightingService = AudioLightingService,
+	NPCService = NPCService,
 }
 
 local INIT_ORDER = {
@@ -62,9 +66,11 @@ local INIT_ORDER = {
 	"CaseGenerationService",
 	"AccusationService",
 	"NightTimerService",
-	"JimpitanSpawnerService", -- spawns world content
+	"JimpitanSpawnerService",    -- spawns world content
 	"WorldObjectSpawnerService", -- spawns world content
-	"InteractionService", -- last: wires ProximityPrompts to every Service above
+	"InteractionService",        -- last: wires ProximityPrompts to every Service above
+	"AudioLightingService",      -- cosmetic: torch/lantern flicker
+	"NPCService",                -- cosmetic: NPC idle sway
 }
 
 for _, name in ipairs(INIT_ORDER) do
@@ -96,6 +102,16 @@ local function onPlayerAdded(player)
 	HorrorService.InitPlayer(player)
 	EntityAIService.InitPlayer(player)
 	NightTimerService.InitPlayer(player, difficulty)
+
+	-- Start cosmetic services per-session
+	-- AudioLightingService and NPCService use OOP pattern: .new():Start()
+	-- They are global (not per-player), so only start once on first player join.
+	-- Subsequent joins skip because _running guard in :Start() prevents double-start.
+	local audioInstance = AudioLightingService.new()
+	audioInstance:Start(difficulty)
+
+	local npcInstance = NPCService.new()
+	npcInstance:Start()
 
 	-- World content spawns asynchronously (waits for Workspace.Map); give it a moment
 	-- before snapshotting, otherwise a player who joins instantly could get an empty list.
